@@ -87,7 +87,9 @@ contract SliceTest is Base {
 
     function converted(Vm.Log[] memory logs) internal pure returns (uint256 spent, uint256 bought, uint256 burnt) {
         for (uint256 i; i < logs.length; i++) {
-            if (logs[i].topics[0] == CONVERTED) (spent, bought, burnt) = abi.decode(logs[i].data, (uint256, uint256, uint256));
+            if (logs[i].topics[0] == CONVERTED) {
+                (spent, bought, burnt) = abi.decode(logs[i].data, (uint256, uint256, uint256));
+            }
         }
     }
 
@@ -136,7 +138,7 @@ contract SliceTest is Base {
         (PoolKey memory ethX,) = initPool(CurrencyLibrary.ADDRESS_ZERO, x, IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
         modifyLiquidityRouter.modifyLiquidity{value: 1e27}(ethX, ModifyLiquidityParams(-887220, 887220, 1e24, 0), "");
         swapNativeInput(ethX, true, -10e18, "", 10e18); // slice 0.01 ETH, over the minimum
-        sampleRoute(2); // the route's third sample: a batch runs
+        sampleRoute(3); // three authenticated past block-start prices: a batch runs
         assertEq(hook.pile(CurrencyLibrary.ADDRESS_ZERO.toId()), 0, "the ETH was sold for IMD");
         assertGt(hook.pile(imd.toId()), 0, "the IMD waits in its pile for the main duel");
         PoolKey[] memory pools = new PoolKey[](2);
@@ -153,9 +155,9 @@ contract SliceTest is Base {
         (PoolKey memory ethX,) = initPool(CurrencyLibrary.ADDRESS_ZERO, x, IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
         modifyLiquidityRouter.modifyLiquidity{value: 1e27}(ethX, ModifyLiquidityParams(-887220, 887220, 1e24, 0), "");
         assertEq(hook.game(ethX.toId()).slice, 0, "slice in ETH");
-        swapNativeInput(ethX, true, -10e18, "", 10e18); // slice 0.01 ETH: the route's first sample, nothing bought yet
+        swapNativeInput(ethX, true, -10e18, "", 10e18); // slice 0.01 ETH: no authenticated route samples yet
         assertEq(hook.pile(CurrencyLibrary.ADDRESS_ZERO.toId()), 0.01e18, "waits for three sampled blocks");
-        sampleRoute(1);
+        sampleRoute(2);
         vm.recordLogs();
         sampleRoute(1); // the third sample: the batch runs
         (uint256 spent, uint256 bought,) = converted(vm.getRecordedLogs());
@@ -200,7 +202,9 @@ contract SliceTest is Base {
         modifyLiquidityRouter.modifyLiquidity(main, ModifyLiquidityParams(-887220, 887220, 10e18, 0), "");
         sampleBlocks(main);
         PoolKey memory duelX = newPool(x, imd);
-        for (uint256 i; i < 5; i++) pay(duelX, imd, 1_000e18); // a deep community duel piles ~5 IMD
+        for (uint256 i; i < 5; i++) {
+            pay(duelX, imd, 1_000e18); // a deep community duel piles ~5 IMD
+        }
         assertGt(hook.pile(imd.toId()), 4e18);
         next(12);
 
@@ -221,7 +225,8 @@ contract SliceTest is Base {
         vm.startPrank(attacker);
         // the band: one tick spacing past a price 20% (in sqrt) further the hook's way, all $IMDUEL
         int24 t1 = TickMath.getTickAtSqrtPrice(uint160(uint256(home) * (hookDir ? 80 : 125) / 100)) / 60 * 60;
-        ModifyLiquidityParams memory band = ModifyLiquidityParams(hookDir ? t1 - 60 : t1, hookDir ? t1 : t1 + 60, 1e22, 0);
+        ModifyLiquidityParams memory band =
+            ModifyLiquidityParams(hookDir ? t1 - 60 : t1, hookDir ? t1 : t1 + 60, 1e22, 0);
         modifyLiquidityRouter.modifyLiquidity(main, band, "");
         // push to the band's edge; this trade's own batch then buys from the band
         pushTo(hookDir, TickMath.getSqrtPriceAtTick(t1));
@@ -251,8 +256,12 @@ contract SliceTest is Base {
             ? SqrtPriceMath.getAmount0Delta(target, now_, l, true)
             : SqrtPriceMath.getAmount1Delta(now_, target, l, true);
         need = need * 1_000_000 / 997_000 * 1_000_000 / 995_000 * 9_999 / 10_000; // LP fee, hook fee, a hair less
-        swapRouter.swap(main, SwapParams(zeroForOne, -int256(need), zeroForOne ? MIN_PRICE_LIMIT : MAX_PRICE_LIMIT),
-            PoolSwapTest.TestSettings(false, false), "");
+        swapRouter.swap(
+            main,
+            SwapParams(zeroForOne, -int256(need), zeroForOne ? MIN_PRICE_LIMIT : MAX_PRICE_LIMIT),
+            PoolSwapTest.TestSettings(false, false),
+            ""
+        );
     }
 
     function _abs(int256 v) internal pure returns (uint256) {
@@ -276,12 +285,12 @@ contract SliceTest is Base {
         modifyLiquidityRouter.modifyLiquidity{value: 1e27}(ethX, ModifyLiquidityParams(-887220, 887220, 1e24, 0), "");
     }
 
-    /// The IMD / ETH pool isn't ours to watch, so an ETH batch is capped instead: a whale's trade in an ETH duel
-    /// leaves a big ETH slice, converted ten minimums at a time.
+    /// Even with authenticated route prices, an ETH batch stays capped: a whale's trade in an ETH duel leaves a
+    /// big ETH slice, converted ten minimums at a time.
     function test_anEthBatchIsCapped() public {
         PoolKey memory ethX = deployEthDuel();
-        swapNativeInput(ethX, true, -100e18, "", 100e18); // slice 0.1 ETH: a hundred minimums; the route's first sample
-        sampleRoute(1);
+        swapNativeInput(ethX, true, -100e18, "", 100e18); // slice 0.1 ETH: a hundred minimums
+        sampleRoute(2);
         vm.recordLogs();
         sampleRoute(1); // the third sample: the batch runs
         (uint256 spent,,) = converted(vm.getRecordedLogs());
@@ -293,14 +302,21 @@ contract SliceTest is Base {
     /// the waiting pile into it batch after batch (swarm audit, engine launch job).
     function test_oneEthBatchPerBlock() public {
         PoolKey memory ethX = deployEthDuel();
-        swapNativeInput(ethX, true, -100e18, "", 100e18); // its own batch samples the route first
+        swapNativeInput(ethX, true, -100e18, "", 100e18);
         uint256 waiting = hook.pile(CurrencyLibrary.ADDRESS_ZERO.toId());
-        sampleRoute(1); // the second
-        for (uint256 i; i < 5; i++) hook.convert(CurrencyLibrary.ADDRESS_ZERO);
+        sampleRoute(2);
+        for (uint256 i; i < 5; i++) {
+            hook.convert(CurrencyLibrary.ADDRESS_ZERO);
+        }
         assertEq(hook.pile(CurrencyLibrary.ADDRESS_ZERO.toId()), waiting, "none until three blocks are sampled");
         next(12);
-        for (uint256 i; i < 5; i++) hook.convert(CurrencyLibrary.ADDRESS_ZERO);
-        assertEq(hook.pile(CurrencyLibrary.ADDRESS_ZERO.toId()), waiting - 10 * MIN, "one in the next, however often asked");
+        proveRoute(vm.getBlockNumber() - 1);
+        for (uint256 i; i < 5; i++) {
+            hook.convert(CurrencyLibrary.ADDRESS_ZERO);
+        }
+        assertEq(
+            hook.pile(CurrencyLibrary.ADDRESS_ZERO.toId()), waiting - 10 * MIN, "one in the next, however often asked"
+        );
     }
 
     /// An ETH batch whose route leg buys nothing (no liquidity near the IMD / ETH price) leaves the ETH waiting and
@@ -320,7 +336,9 @@ contract SliceTest is Base {
         uint256 waiting = hook.pile(CurrencyLibrary.ADDRESS_ZERO.toId());
         assertEq(waiting, 0.01e18, "the ETH waits");
         hook.convert(CurrencyLibrary.ADDRESS_ZERO);
-        assertEq(hook.pile(CurrencyLibrary.ADDRESS_ZERO.toId()), waiting, "asked directly: nothing to buy, nothing lost");
+        assertEq(
+            hook.pile(CurrencyLibrary.ADDRESS_ZERO.toId()), waiting, "asked directly: nothing to buy, nothing lost"
+        );
         PoolKey[] memory pools = new PoolKey[](2);
         (pools[0], pools[1]) = (main, ethX);
         assertSolvent(CurrencyLibrary.ADDRESS_ZERO, pools, nobody());

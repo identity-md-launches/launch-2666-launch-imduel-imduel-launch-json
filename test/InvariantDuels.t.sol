@@ -52,11 +52,18 @@ contract DuelsHandler is Test {
     uint256 public swaps;
     uint256 public moves;
 
-    constructor(IMDuelHook hook_, PoolSwapTest router_, PoolModifyLiquidityTest lpRouter_, PoolKey[] memory pools_,
-        Currency[] memory currencies_, bool events_)
-    {
+    constructor(
+        IMDuelHook hook_,
+        PoolSwapTest router_,
+        PoolModifyLiquidityTest lpRouter_,
+        PoolKey[] memory pools_,
+        Currency[] memory currencies_,
+        bool events_
+    ) {
         (hook, router, lpRouter, withEvents) = (hook_, router_, lpRouter_, events_);
-        for (uint256 i; i < pools_.length; i++) pools.push(pools_[i]);
+        for (uint256 i; i < pools_.length; i++) {
+            pools.push(pools_[i]);
+        }
         for (uint256 i; i < currencies_.length; i++) {
             currencies.push(currencies_[i]);
             if (currencies_[i].isAddressZero()) continue;
@@ -73,7 +80,7 @@ contract DuelsHandler is Test {
         // paid in ETH, it takes 1 wei of IMD from the PoolManager and leaves the debt: its reward must be refused and
         // owed, never let it revert the trade
         owners.push(address(new DebtOwner(hook_.manager(), currencies_[0])));
-        owners.push(tx.origin);
+        owners.push(address(router));
     }
 
     /// The chain's block and time, read in a fresh call: with via_ir a function that rolled may reuse stale values.
@@ -103,7 +110,7 @@ contract DuelsHandler is Test {
         bool imdFirst = hook.imd() == pools[0].currency0;
         uint160 ref = startSqrt;
         if (prevStartSqrt != 0 && (imdFirst ? prevStartSqrt > ref : prevStartSqrt < ref)) ref = prevStartSqrt;
-        uint256 worth = imdFirst // `bought` $IMDUEL in IMD at the reference price
+        uint256 worth = imdFirst  // `bought` $IMDUEL in IMD at the reference price
             ? FullMath.mulDiv(FullMath.mulDiv(bought, 1 << 96, ref), 1 << 96, ref)
             : FullMath.mulDiv(FullMath.mulDiv(bought, ref, 1 << 96), ref, 1 << 96);
         need(spent <= worth * 10_055 / 10_000 + 2, "SP-05 a batch within 0.5% of a price older than this block");
@@ -136,15 +143,25 @@ contract DuelsHandler is Test {
         // bid in this block can take
         for (uint256 t; t < 2; t++) {
             (IMDuelHook.TopBid memory x, IMDuelHook.TopBid memory y) = (a.bids[t], b.bids[t]);
-            if ((t == mover && (played || expired)) || !x.open || !y.open || (y.owner == x.owner && y.size == x.size)) continue;
+            if ((t == mover && (played || expired)) || !x.open || !y.open || (y.owner == x.owner && y.size == x.size)) {
+                continue;
+            }
             need(uint256(y.size) * 100 > uint256(x.size) * 110, "SP-03 only a bid 10% bigger takes the top spot");
         }
         if (played) return;
         (IMDuelHook.TopBid memory was, IMDuelHook.TopBid memory cur) = (a.bids[mover], b.bids[mover]);
-        bool opened = cur.open && cur.owner == address(0) && cur.size == 0 && !(was.open && was.owner == address(0) && was.size == 0);
-        if (opened) need(time >= a.turnStart + hook.TURN_TIMEOUT() || expired, "SP-04 a timeout only after silence or an expired hash");
+        bool opened = cur.open && cur.owner == address(0) && cur.size == 0
+            && !(was.open && was.owner == address(0) && was.size == 0);
+        if (opened) {
+            need(
+                time >= a.turnStart + hook.TURN_TIMEOUT() || expired,
+                "SP-04 a timeout only after silence or an expired hash"
+            );
+        }
         // SP-06: a move's window closes: past it, its bid is final; it only moves to the block a first bid lands in
-        if (was.open && now_ > a.closeBlock && !expired) need(cur.owner == was.owner && cur.size == was.size, "SP-06 a closed window takes no bids");
+        if (was.open && now_ > a.closeBlock && !expired) {
+            need(cur.owner == was.owner && cur.size == was.size, "SP-06 a closed window takes no bids");
+        }
         need(b.closeBlock == a.closeBlock || b.closeBlock == now_, "SP-06 a window only moves to this block");
     }
 
@@ -187,12 +204,18 @@ contract DuelsHandler is Test {
         _blockStarts();
         IMDuelHook.Game memory before = hook.game(k.toId());
         bytes32[] memory others = new bytes32[](pools.length);
-        for (uint256 i; i < pools.length; i++) others[i] = _gameHash(i);
+        for (uint256 i; i < pools.length; i++) {
+            others[i] = _gameHash(i);
+        }
         bytes memory data = owner % 5 == 4 ? bytes("") : abi.encodePacked(owners[owner % 4]);
         if (withEvents) vm.recordLogs();
         router.swap{value: ethIn ? size : 0}(
             k,
-            SwapParams(zeroForOne, exactOut ? int256(size) : -int256(size), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1),
+            SwapParams(
+                zeroForOne,
+                exactOut ? int256(size) : -int256(size),
+                zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            ),
             PoolSwapTest.TestSettings(false, false),
             data
         );
@@ -215,12 +238,24 @@ contract DuelsHandler is Test {
         (Currency a, Currency b) = zeroForOne ? (k.currency0, k.currency1) : (k.currency1, k.currency0);
         (uint256 a0, uint256 b0) = (a.balanceOfSelf(), b.balanceOfSelf());
         bytes memory data = abi.encodePacked(owners[1]);
-        router.swap(k, SwapParams(zeroForOne, -int256(size), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1
-            : TickMath.MAX_SQRT_PRICE - 1), PoolSwapTest.TestSettings(false, false), data);
+        router.swap(
+            k,
+            SwapParams(
+                zeroForOne, -int256(size), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            ),
+            PoolSwapTest.TestSettings(false, false),
+            data
+        );
         uint256 got = b.balanceOfSelf() - b0;
         if (got == 0) return;
-        router.swap(k, SwapParams(!zeroForOne, -int256(got), zeroForOne ? TickMath.MAX_SQRT_PRICE - 1
-            : TickMath.MIN_SQRT_PRICE + 1), PoolSwapTest.TestSettings(false, false), data);
+        router.swap(
+            k,
+            SwapParams(
+                !zeroForOne, -int256(got), zeroForOne ? TickMath.MAX_SQRT_PRICE - 1 : TickMath.MIN_SQRT_PRICE + 1
+            ),
+            PoolSwapTest.TestSettings(false, false),
+            data
+        );
         need(a.balanceOfSelf() <= a0, "SP-06 no round-trip profit");
         need(b.balanceOfSelf() <= b0, "SP-06 no round-trip profit");
     }
@@ -258,7 +293,8 @@ contract DuelsHandler is Test {
 
     function _lp(PoolKey memory k, int256 liquidity) internal {
         lpRouter.modifyLiquidity{value: k.currency0.isAddressZero() && liquidity > 0 ? 1e28 : 0}(
-            k, ModifyLiquidityParams(-887220, 887220, liquidity, bytes32(uint256(1))), "");
+            k, ModifyLiquidityParams(-887220, 887220, liquidity, bytes32(uint256(1))), ""
+        );
     }
 
     /// A batch at the start of the next block, as the first observer of the main duel.
@@ -301,8 +337,8 @@ contract DuelsHandler is Test {
         _blockStarts();
         Currency imduel = hook.imduel();
         uint256 side = imduel < hook.imd() ? 0 : 1;
-        (uint256 pile0, uint256 chest0, uint256 dead0) = (hook.pile(cur.toId()), hook.chest(hook.mainId(), side),
-            imduel.balanceOf(address(0xdEaD)));
+        (uint256 pile0, uint256 chest0, uint256 dead0) =
+            (hook.pile(cur.toId()), hook.chest(hook.mainId(), side), imduel.balanceOf(address(0xdEaD)));
         hook.convert(cur);
         if (cur == hook.imd() && hook.pile(cur.toId()) < pile0) {
             uint256 bought = hook.chest(hook.mainId(), side) - chest0 + imduel.balanceOf(address(0xdEaD)) - dead0;
@@ -341,7 +377,8 @@ contract InvariantDuelsTest is Base {
         (Currency c0, Currency c1) = sorted(a, b);
         (k,) = initPool(c0, c1, h, 3000, SQRT_PRICE_1_1);
         modifyLiquidityRouter.modifyLiquidity{value: c0.isAddressZero() ? 1e27 : 0}(
-            k, ModifyLiquidityParams(-887220, 887220, liquidity, 0), "");
+            k, ModifyLiquidityParams(-887220, 887220, liquidity, 0), ""
+        );
     }
 
     function setUp() public {
@@ -378,7 +415,9 @@ contract InvariantDuelsTest is Base {
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_everyCurrencyBalances() public view {
         address[] memory who = new address[](handler.ownersLength());
-        for (uint256 j; j < who.length; j++) who[j] = handler.owners(j);
+        for (uint256 j; j < who.length; j++) {
+            who[j] = handler.owners(j);
+        }
         Currency[4] memory cs = [imdC, duelC, xC, CurrencyLibrary.ADDRESS_ZERO];
         for (uint256 i; i < 4; i++) {
             (uint256 held, uint256 total) = books(cs[i], keys, who);
@@ -447,7 +486,9 @@ contract InvariantDuelsTest is Base {
             need(g.closeBlock < block.number + hook.turnBlocks(), "GL-05 a window ends at most turnBlocks ahead");
             for (uint256 t; t < 2; t++) {
                 IMDuelHook.TopBid memory b = g.bids[t];
-                if (b.owner == address(0)) need(b.size == 0 && b.cap == 0 && b.strength == 0, "GL-05 a move for nobody is empty");
+                if (b.owner == address(0)) {
+                    need(b.size == 0 && b.cap == 0 && b.strength == 0, "GL-05 a move for nobody is empty");
+                }
                 need(b.strength <= 9_000, "GL-05 strength at most 90%");
             }
             need(g.moveStrength <= 9_000, "GL-05 strength at most 90%");

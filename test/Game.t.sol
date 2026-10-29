@@ -61,9 +61,9 @@ contract GameTest is Base {
         assertEq(bid().owner, address(0xB), "the same trade bids for Black");
     }
 
-    function test_ownerDefaultsToTxOrigin() public {
+    function test_ownerDefaultsToSwapSender() public {
         white(1e18, address(0));
-        assertEq(bid().owner, tx.origin);
+        assertEq(bid().owner, address(swapRouter));
     }
 
     function test_theOtherTeamCannotBidOnThisTurn() public {
@@ -233,8 +233,9 @@ contract GameTest is Base {
     // ---------------------------------------------------------------- configuration
 
     function newHook(HookConfig memory c) internal returns (IMDuelHook) {
-        return new IMDuelHook(c.manager, c.engine, c.imd, c.ethFee, c.ethSpacing, c.minImd, c.minEth,
-            c.minImduel, c.turnBlocks);
+        return new IMDuelHook(
+            c.manager, c.engine, c.imd, c.ethFee, c.ethSpacing, c.minImd, c.minEth, c.minImduel, c.turnBlocks
+        );
     }
 
     /// Uniswap's hook checklist, item 1: only the PoolManager drives the callbacks, only the hook itself pays out or

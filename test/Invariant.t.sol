@@ -37,7 +37,7 @@ contract Handler is Test {
         owners.push(address(0xA));
         owners.push(address(0xB));
         owners.push(address(0xC));
-        owners.push(tx.origin);
+        owners.push(address(router));
     }
 
     function ownersLength() external view returns (uint256) {
@@ -50,7 +50,11 @@ contract Handler is Test {
         bytes memory data = owner % 5 == 4 ? bytes("") : abi.encodePacked(owners[owner % 3]);
         router.swap(
             key,
-            SwapParams(zeroForOne, exactOut ? int256(size) : -int256(size), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1),
+            SwapParams(
+                zeroForOne,
+                exactOut ? int256(size) : -int256(size),
+                zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            ),
             PoolSwapTest.TestSettings(false, false),
             data
         );
@@ -116,7 +120,9 @@ contract InvariantTest is Base {
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_heldEqualsOwed() public view {
         address[] memory who = new address[](handler.ownersLength());
-        for (uint256 j; j < who.length; j++) who[j] = handler.owners(j);
+        for (uint256 j; j < who.length; j++) {
+            who[j] = handler.owners(j);
+        }
         assertSolvent(who);
     }
 

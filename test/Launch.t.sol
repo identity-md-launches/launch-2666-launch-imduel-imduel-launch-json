@@ -77,13 +77,13 @@ contract LaunchTest is Base {
         uint256 g0 = gasleft();
         buy(50e18);
         emit log_named_uint("first buy (opens game 0, bids for White)", g0 - gasleft());
-        assertEq(bid().owner, tx.origin, "the first buy owns White's turn");
+        assertEq(bid().owner, address(swapRouter), "the first buy owns White's turn");
 
         // the pool now holds IMD: a seller in the next block plays White's move and bids for Black
         next(12);
         sell(1_000_000e18);
         assertEq(st().ply, 1, "White's move is played");
-        assertTrue(bid().open && bid().owner == tx.origin, "a sell bids for Black");
+        assertTrue(bid().open && bid().owner == address(swapRouter), "a sell bids for Black");
 
         // trading on: the IMD slice converts into $IMDUEL in the main duel itself, half to its chest, half burned
         uint256 dead = MockERC20(Currency.unwrap(duel)).balanceOf(address(0xdEaD));
@@ -92,7 +92,11 @@ contract LaunchTest is Base {
             if (nextTeam() == (duel == pool.currency0 ? 0 : 1)) buy(100e18);
             else sell(2_000_000e18);
         }
-        assertEq(MockERC20(Currency.unwrap(duel)).balanceOf(address(0xdEaD)), dead, "these trades swing the price every block: no batch trusts it yet");
+        assertEq(
+            MockERC20(Currency.unwrap(duel)).balanceOf(address(0xdEaD)),
+            dead,
+            "these trades swing the price every block: no batch trusts it yet"
+        );
         sampleBlocks(pool); // a calm stretch of three blocks
         next(12);
         buy(100e18);
@@ -119,7 +123,9 @@ contract LaunchTest is Base {
         uint160 a = TickMath.getSqrtPriceAtTick(-EDGE);
         uint160 b = TickMath.getSqrtPriceAtTick(open);
         uint256 liquidity = FullMath.mulDiv(SUPPLY * LaunchPolicy.SEED_BPS / 10_000, 1 << 96, b - a);
-        modifyLiquidityRouter.modifyLiquidity(pool, ModifyLiquidityParams(-EDGE, open, int256(liquidity * 999 / 1000), 0), "");
+        modifyLiquidityRouter.modifyLiquidity(
+            pool, ModifyLiquidityParams(-EDGE, open, int256(liquidity * 999 / 1000), 0), ""
+        );
         assertEq(Currency.unwrap(hook.imduel()), address(t));
         vm.deal(address(this), 100 ether);
         swapNativeInput(pool, true, -0.5 ether, "", 0.5 ether); // buy $IMDUEL with ETH
@@ -135,7 +141,11 @@ contract LaunchTest is Base {
         swapNativeInput(pool, true, -0.5 ether, "", 0.5 ether);
         assertGt(t.balanceOf(address(0xdEaD)), dead, "the ETH slice bought $IMDUEL, half burned");
         assertGt(st().ply, 20);
-        assertSolvent(nobody());
+        // Empty hookData now assigns the bid to the swap router, which cannot receive native ETH in this fixture.
+        // Its failed native payouts remain claims owed to the router, and belong in the solvency equation.
+        address[] memory recipients = new address[](1);
+        recipients[0] = address(swapRouter);
+        assertSolvent(recipients);
     }
 
     function test_launchTokenBelowImd() public {

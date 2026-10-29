@@ -18,6 +18,7 @@ import {Chess} from "./Chess.sol";
 import {Strength} from "./Strength.sol";
 import {Rules} from "./Rules.sol";
 import {IChessEngine} from "./IChessEngine.sol";
+import {RoutePriceVerifier} from "./RoutePriceVerifier.sol";
 
 // The hook's permission bits; its address must carry them.
 uint160 constant IMDUEL_HOOK_FLAGS = Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
@@ -88,6 +89,7 @@ contract IMDuelHook is IUnlockCallback {
     uint256 internal immutable minEth;
     uint256 internal immutable minImduel;
     uint256 public immutable turnBlocks; // how many blocks a move stays open for bids once the previous one is played
+    RoutePriceVerifier public immutable routePriceVerifier;
 
     struct Game {
         bool live; // pool initialized with this hook
@@ -149,9 +151,9 @@ contract IMDuelHook is IUnlockCallback {
     PoolId public mainId;
     // Price samples of the pools batches swap in (0 the main duel, 1 the IMD / ETH route), one slot each (_sample): the block of the latest batch (40 bits),
     // the block of the latest sample (40), and the price at the start of the three latest sampled blocks (56 each,
-    // newest lowest). A batch buys within 0.1% (sqrt) of the most hook-favourable of the three, so a price pushed
-    // inside a block, or at the end of the block before, can't sell the hook $IMDUEL dear: it must be held through two
-    // public blocks. The main duel is sampled by its every trade and batch, the IMD / ETH route by each ETH batch.
+    // newest lowest). A batch buys within 0.1% (sqrt) of the most hook-favourable of the three. The main duel is
+    // sampled before every trade and batch; the hookless ETH route requires authenticated past start prices,
+    // submitted with sampleRoute. A conversion call cannot sample the route's manipulable current spot price.
     uint256[2] internal samples;
     mapping(uint256 => uint256) public pile; // protocol slices waiting for conversion, by currency id
     mapping(address => mapping(uint256 => uint256)) public owed; // failed payouts, withdrawable by currency id
@@ -172,11 +174,14 @@ contract IMDuelHook is IUnlockCallback {
     event GameOver(PoolId indexed pool, uint32 gameNo, uint8 result, uint16 plies); // 1 white, 2 black, 3 draw
     event DrawTriggered(PoolId indexed pool, uint32 gameNo, uint8 reason, uint16 plies); // 1 stalemate, 2 material, 3 repetition, 4 quiet, 5 cap
     event EngineFailed(PoolId indexed pool, uint32 gameNo, uint16 ply);
-    event Reward(PoolId indexed pool, uint32 gameNo, uint16 ply, address owner, Currency currency, uint256 amount, bool paid);
+    event Reward(
+        PoolId indexed pool, uint32 gameNo, uint16 ply, address owner, Currency currency, uint256 amount, bool paid
+    );
     event Withdrawn(address indexed who, Currency currency, uint256 amount);
     event ChestFunded(PoolId indexed pool, address indexed from, Currency currency, uint256 amount);
     event Converted(Currency indexed from, uint256 spent, uint256 bought, uint256 burned);
     event MainDuel(PoolId indexed pool, Currency imduel);
+    event RouteSampled(uint256 indexed blockNumber, uint160 sqrtPriceX96);
 
     error NotManager();
     error NotSelf();
@@ -187,20 +192,30 @@ contract IMDuelHook is IUnlockCallback {
     error NoRoute(); // a duel pairs IMD, $IMDUEL or routed native ETH, so its slice converts into $IMDUEL
     error PartialFill(); // the trade's price limit stopped it before its whole order traded
     error Unsettled(); // a payout's recipient opened or closed a PoolManager delta: refused, the reward stays owed
+    error BadSample();
 
     /// Plain arguments, as the IMD launch factory passes them (launch.json): the PoolManager, the engine, IMD (the
     /// currency the main duel pairs with; native ETH for an ETH-paired launch, then with no ETH route), the hookless
     /// IMD / native ETH pool the ETH slice is sold in (fee 0: none) and the smallest pile worth a conversion batch per
     /// routing currency (with an ETH route, the ETH minimum also sizes the ETH batch cap, so it can't be 0), and how
     /// many blocks a move stays open for bids (3 on Ethereum, about 36 seconds; at least 1).
-    constructor(IPoolManager manager_, IChessEngine engine_, Currency imd_, uint24 ethFee_, uint24 ethSpacing_,
-        uint256 minImd_, uint256 minEth_, uint256 minImduel_, uint256 turnBlocks_)
-    {
+    constructor(
+        IPoolManager manager_,
+        IChessEngine engine_,
+        Currency imd_,
+        uint24 ethFee_,
+        uint24 ethSpacing_,
+        uint256 minImd_,
+        uint256 minEth_,
+        uint256 minImduel_,
+        uint256 turnBlocks_
+    ) {
         // the engine is not checked here: the launch's admission tests build the hook on a chain where it has no code
         // (hook job f7f2a606); its address is checked off chain, and a trade with no engine to answer just waits
-        if (address(engine_) == address(0) || (ethFee_ != 0 && (imd_.isAddressZero() || minEth_ == 0))
-            || ethSpacing_ > uint24(type(int24).max) || turnBlocks_ == 0 || turnBlocks_ > 1_000)
-        {
+        if (
+            address(engine_) == address(0) || (ethFee_ != 0 && (imd_.isAddressZero() || minEth_ == 0))
+                || ethSpacing_ > uint24(type(int24).max) || turnBlocks_ == 0 || turnBlocks_ > 1_000
+        ) {
             revert BadConfig();
         }
         turnBlocks = turnBlocks_;
@@ -208,6 +223,7 @@ contract IMDuelHook is IUnlockCallback {
         (ethFee, ethSpacing) = (ethFee_, int24(ethSpacing_));
         (minImd, minEth, minImduel) = (minImd_, minEth_, minImduel_);
         Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
+        routePriceVerifier = new RoutePriceVerifier();
     }
 
     // ---------------------------------------------------------------- views
@@ -215,7 +231,7 @@ contract IMDuelHook is IUnlockCallback {
     /// The callbacks this hook uses, which its address carries (v4's BaseHook convention: the IMD launch reads it).
     function getHookPermissions() public pure returns (Hooks.Permissions memory p) {
         (p.afterInitialize, p.beforeSwap, p.afterSwap, p.beforeSwapReturnDelta, p.afterSwapReturnDelta) =
-            (true, true, true, true, true);
+        (true, true, true, true, true);
     }
 
     function game(PoolId id) external view returns (Game memory) {
@@ -258,7 +274,9 @@ contract IMDuelHook is IUnlockCallback {
             emit MainDuel(id, token);
         }
         // every duel's slice buys $IMDUEL: one side must be IMD, $IMDUEL or native ETH with its route
-        if (!(c0 == imd || c1 == imd || c0 == imduel || c1 == imduel || (c0.isAddressZero() && ethFee != 0))) revert NoRoute();
+        if (!(c0 == imd || c1 == imd || c0 == imduel || c1 == imduel || (c0.isAddressZero() && ethFee != 0))) {
+            revert NoRoute();
+        }
         // the slice is taken in the side it converts from most simply: IMD, then $IMDUEL, then native ETH
         g.slice = c1 == imd ? 1 : c0 == imd ? 0 : c1 == imduel ? 1 : 0;
         _newGame(id, g);
@@ -284,10 +302,13 @@ contract IMDuelHook is IUnlockCallback {
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(taken, 0), 0);
     }
 
-    function afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata hookData)
-        external
-        returns (bytes4, int128)
-    {
+    function afterSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        BalanceDelta delta,
+        bytes calldata hookData
+    ) external returns (bytes4, int128) {
         _onlyManager();
         PoolId id = key.toId();
         Game storage g = games[id];
@@ -295,12 +316,14 @@ contract IMDuelHook is IUnlockCallback {
         uint256 specIdx = _specified(params);
         // the whole order, less the fee taken before the swap, must have traded: that fee counted all of it, so a trade
         // its price limit stopped early would pay it on what never traded (up to 25.4% in the main duel's opening)
-        if (int256(specIdx == 0 ? delta.amount0() : delta.amount1()) != params.amountSpecified + taken) revert PartialFill();
+        if (int256(specIdx == 0 ? delta.amount0() : delta.amount1()) != params.amountSpecified + taken) {
+            revert PartialFill();
+        }
         uint256 unspecIdx = 1 - specIdx;
         int128 fee = _takeFee(id, key, unspecIdx, _abs(unspecIdx == 0 ? delta.amount0() : delta.amount1()), chestIdx, g);
         if (!_locked()) {
             _lock(true);
-            _play(id, key, g, params.zeroForOne, delta, hookData, sqrtPrice, liquidity);
+            _play(id, key, g, params.zeroForOne, delta, _bidOwner(sender, hookData), sqrtPrice, liquidity);
             _lock(false);
         }
         return (IHooks.afterSwap.selector, fee);
@@ -417,6 +440,21 @@ contract IMDuelHook is IUnlockCallback {
         manager.unlock(abi.encode(uint8(2), abi.encode(address(0), c, uint256(0))));
     }
 
+    /// Anyone may supply a past block header and eth_getProof for the route's PoolManager slot0. The header's
+    /// state is the following block's start price. Samples must arrive in increasing order; a gap restarts the
+    /// three-block window. A route batch requires the newest sample to be the previous block's start.
+    function sampleRoute(bytes calldata header, bytes[] calldata accountProof, bytes[] calldata storageProof) external {
+        if (ethFee == 0) revert NoRoute();
+        PoolId route = PoolKey(CurrencyLibrary.ADDRESS_ZERO, imd, ethFee, ethSpacing, IHooks(address(0))).toId();
+        bytes32 slot = keccak256(abi.encode(route, StateLibrary.POOLS_SLOT));
+        (uint256 n, uint160 p) = routePriceVerifier.verify(address(manager), slot, header, accountProof, storageProof);
+        uint256 previous = (samples[1] >> 168) & 0xffffffffff;
+        if (n <= previous || n > type(uint40).max) revert BadSample();
+        if (n != previous + 1) samples[1] &= (uint256(0xffffffffff) << 208); // keep the batch's block, clear prices
+        _sampleAt(1, p, n);
+        emit RouteSampled(n, p);
+    }
+
     function unlockCallback(bytes calldata data) public virtual returns (bytes memory) {
         _onlyManager();
         (uint8 action, bytes memory body) = abi.decode(data, (uint8, bytes));
@@ -435,7 +473,8 @@ contract IMDuelHook is IUnlockCallback {
             paid = manager.settle{value: amount}();
         } else {
             // the return value is not read (some tokens return nothing): settle() credits what actually arrived
-            (bool ok,) = Currency.unwrap(c).call(abi.encodeCall(IERC20Min.transferFrom, (who, address(manager), amount)));
+            (bool ok,) =
+                Currency.unwrap(c).call(abi.encodeCall(IERC20Min.transferFrom, (who, address(manager), amount)));
             if (!ok) revert BadValue();
             paid = manager.settle();
         }
@@ -465,7 +504,8 @@ contract IMDuelHook is IUnlockCallback {
         } else if (c.isAddressZero() && ethFee != 0) {
             uint256 imdIn;
             uint256 imdSpent;
-            (spent, imdIn) = _swapClaims(PoolKey(c, imd, ethFee, ethSpacing, IHooks(address(0))), c, _batch(amount, minEth), false);
+            (spent, imdIn) =
+                _swapClaims(PoolKey(c, imd, ethFee, ethSpacing, IHooks(address(0))), c, _batch(amount, minEth), false);
             (imdSpent, bought) = _swapClaims(_mainKey(), imd, imdIn, true);
             pile[imd.toId()] += imdIn - imdSpent; // what the main duel's price limit left waits with the IMD pile
         } else if (!(c == imduel)) {
@@ -495,12 +535,12 @@ contract IMDuelHook is IUnlockCallback {
         bool zeroForOne = input == key.currency0;
         (uint160 sqrtPrice,,,) = manager.getSlot0(key.toId());
         uint256 pool = main ? 0 : 1;
-        uint256 s = _sample(pool, sqrtPrice);
+        uint256 s = main ? _sample(0, sqrtPrice) : samples[1];
+        if (!main && ((s >> 168) & 0xffffffffff) + 1 != block.number) return (0, 0);
         uint256 from = _reference(s, zeroForOne);
         if (from == 0 || amountIn == 0) return (0, 0);
-        uint160 limit = uint160(
-            zeroForOne ? from * (10_000 - BATCH_SQRT_BPS) / 10_000 : from * (10_000 + BATCH_SQRT_BPS) / 10_000
-        );
+        uint160 limit =
+            uint160(zeroForOne ? from * (10_000 - BATCH_SQRT_BPS) / 10_000 : from * (10_000 + BATCH_SQRT_BPS) / 10_000);
         if (zeroForOne ? limit >= sqrtPrice : limit <= sqrtPrice) return (0, 0);
         BalanceDelta d = manager.swap(key, SwapParams(zeroForOne, -int256(amountIn), limit), "");
         (int128 inDelta, int128 outDelta) = zeroForOne ? (d.amount0(), d.amount1()) : (d.amount1(), d.amount0());
@@ -511,12 +551,16 @@ contract IMDuelHook is IUnlockCallback {
         samples[pool] = (s & ((1 << 208) - 1)) | (block.number << 208); // this block's batch
     }
 
-    /// Records `sqrtPrice` as pool `pool`'s price at the start of this block, once per block (the first observation
-    /// of a block comes before any swap of it has moved the price), and returns the pool's samples word.
+    /// The main pool's first callback precedes any swap that could move its block-start price.
     function _sample(uint256 pool, uint160 sqrtPrice) internal returns (uint256 s) {
+        return _sampleAt(pool, sqrtPrice, block.number);
+    }
+
+    function _sampleAt(uint256 pool, uint160 sqrtPrice, uint256 sampleBlock) internal returns (uint256 s) {
         s = samples[pool];
-        if ((s >> 168) & 0xffffffffff == block.number) return s;
-        s = (s & (0xffffffffff << 208)) | (block.number << 168) | ((s << SAMPLE_BITS) & ((1 << 168) - 1)) | _pack(sqrtPrice);
+        if ((s >> 168) & 0xffffffffff == sampleBlock) return s;
+        s = (s & (0xffffffffff << 208)) | (sampleBlock << 168) | ((s << SAMPLE_BITS) & ((1 << 168) - 1))
+            | _pack(sqrtPrice);
         samples[pool] = s;
     }
 
@@ -567,9 +611,16 @@ contract IMDuelHook is IUnlockCallback {
     /// next move (the move being bid for now, if its team is to move) and takes the top spot if it pays more than
     /// RAISE_PCT over the current top; a trade of the other team after TURN_TIMEOUT of silence opens the silent side's
     /// move at 0%; then a slice batch converts if this pool's pile is ready.
-    function _play(PoolId id, PoolKey calldata key, Game storage g, bool zeroForOne, BalanceDelta delta,
-        bytes calldata hookData, uint160 sqrtPrice, uint256 liquidity) internal
-    {
+    function _play(
+        PoolId id,
+        PoolKey calldata key,
+        Game storage g,
+        bool zeroForOne,
+        BalanceDelta delta,
+        address owner,
+        uint160 sqrtPrice,
+        uint256 liquidity
+    ) internal {
         uint256 mover = teamOf(g.slice, g.gameNo, g.ply & 1 == 1);
         if (g.bids[mover].open && block.number > g.closeBlock) {
             _resolve(id, key, g, mover);
@@ -577,19 +628,18 @@ contract IMDuelHook is IUnlockCallback {
         }
         uint256 team = zeroForOne ? 1 : 0; // the token bought
         TopBid storage b = g.bids[team];
-        (uint256 paid, uint256 got) = team == 1
-            ? (_abs(delta.amount0()), _abs(delta.amount1()))
-            : (_abs(delta.amount1()), _abs(delta.amount0()));
+        (uint256 paid, uint256 got) =
+            team == 1 ? (_abs(delta.amount0()), _abs(delta.amount1())) : (_abs(delta.amount1()), _abs(delta.amount0()));
         if (team == mover) {
             bool late = block.number > g.closeBlock;
             // a move whose window closed but that couldn't be played (the engine failed twice; it shouldn't) takes
             // no more bids
             if (!(late && b.open) && _beats(paid, b)) {
                 if (late) g.closeBlock = uint40(block.number); // the window passed without a bid: this block is it
-                _bid(id, g, team, g.ply, _trade(team, paid, got, hookData, sqrtPrice, liquidity));
+                _bid(id, g, team, g.ply, _trade(team, paid, got, owner, sqrtPrice, liquidity));
             }
         } else {
-            if (_beats(paid, b)) _bid(id, g, team, g.ply + 1, _trade(team, paid, got, hookData, sqrtPrice, liquidity));
+            if (_beats(paid, b)) _bid(id, g, team, g.ply + 1, _trade(team, paid, got, owner, sqrtPrice, liquidity));
             if (!g.bids[mover].open && block.timestamp >= g.turnStart + TURN_TIMEOUT) {
                 // the silent side's move, at 0% for nobody; a real bid in this block takes it
                 g.closeBlock = uint40(block.number);
@@ -602,15 +652,26 @@ contract IMDuelHook is IUnlockCallback {
         }
     }
 
-    /// The trade a bid is made with: its owner (the address our site sends, else the signing wallet) and its strength
+    /// An explicit reward recipient can be packed (20 bytes) or ABI-encoded (32 bytes, clean padding). Otherwise
+    /// the swap sender owns the bid. This is usually a router; tx.origin may be an unrelated bundler or relayer.
+    function _bidOwner(address sender, bytes calldata hookData) internal pure returns (address) {
+        if (hookData.length == 20) return address(bytes20(hookData));
+        if (hookData.length == 32) {
+            uint256 value = uint256(bytes32(hookData));
+            if (value <= type(uint160).max) return address(uint160(value));
+        }
+        return sender;
+    }
+
+    /// The trade a bid is made with: its owner and its strength
     /// from its share of the in-range depth of the token it paid with, at the swap's start price.
-    function _trade(uint256 team, uint256 paid, uint256 got, bytes calldata hookData, uint160 sqrtPrice,
-        uint256 liquidity) internal view returns (Trade memory)
+    function _trade(uint256 team, uint256 paid, uint256 got, address owner, uint160 sqrtPrice, uint256 liquidity)
+        internal
+        pure
+        returns (Trade memory)
     {
-        uint256 depth = team == 1
-            ? FullMath.mulDiv(liquidity, 1 << 96, sqrtPrice)
-            : FullMath.mulDiv(liquidity, sqrtPrice, 1 << 96);
-        address owner = hookData.length == 20 ? address(bytes20(hookData)) : tx.origin;
+        uint256 depth =
+            team == 1 ? FullMath.mulDiv(liquidity, 1 << 96, sqrtPrice) : FullMath.mulDiv(liquidity, sqrtPrice, 1 << 96);
         return Trade(paid, got * PAYOUT_CAP, owner, Strength.fromShare(paid, depth));
     }
 
@@ -659,8 +720,13 @@ contract IMDuelHook is IUnlockCallback {
         uint256 seed = uint256(keccak256(abi.encode(h, id, g.gameNo, g.ply, t.owner, t.size)));
         bool black = g.ply & 1 == 1;
         (uint32 own, uint32 other) = black ? (g.blackState, g.whiteState) : (g.whiteState, g.blackState);
-        (ok, m, r) = _engine(ENGINE_GAS, abi.encodeCall(IChessEngine.play,
-            (g.board, own, other, black, uint256(t.strength), seed, _history(id, g.ply, g.quiet), g.gameNo, g.quiet)));
+        (ok, m, r) = _engine(
+            ENGINE_GAS,
+            abi.encodeCall(
+                IChessEngine.play,
+                (g.board, own, other, black, uint256(t.strength), seed, _history(id, g.ply, g.quiet), g.gameNo, g.quiet)
+            )
+        );
         if (ok) return (ok, false, m, r);
         _enoughGas(ENGINE_GAS);
         (ok, m, r) = _engine(FALLBACK_GAS, abi.encodeCall(IChessEngine.playAny, (g.board, own, other, black, seed)));
@@ -707,7 +773,9 @@ contract IMDuelHook is IUnlockCallback {
     function _history(PoolId id, uint16 ply, uint16 quiet) internal view returns (uint64[8] memory previous) {
         if (quiet < 3) return previous;
         (uint256 lo, uint256 hi) = _lanes(id, ply);
-        for (uint256 i; i < 8; i++) previous[i] = _key(lo, hi, ((ply + 14 - i * 2) % 16) >> 1);
+        for (uint256 i; i < 8; i++) {
+            previous[i] = _key(lo, hi, ((ply + 14 - i * 2) % 16) >> 1);
+        }
     }
 
     /// Records a move played by the rules (`r`: the new position and how the game stands), clears its bid and opens
@@ -796,8 +864,10 @@ contract IMDuelHook is IUnlockCallback {
         if (g.quiet < 4) return false;
         uint64 k = Chess.positionKey(g.board, g.whiteState, g.blackState, g.ply & 1 == 1, g.gameNo);
         uint256 seen;
-        if (g.board == Chess.START_BOARD && g.whiteState == Chess.START_WHITE && g.blackState == Chess.START_BLACK
-            && g.ply & 1 == 0) seen = 1;
+        if (
+            g.board == Chess.START_BOARD && g.whiteState == Chess.START_WHITE && g.blackState == Chess.START_BLACK
+                && g.ply & 1 == 0
+        ) seen = 1;
         // the key's side to move is g.ply's; those positions were made by half-moves of the other parity
         (uint256 lo, uint256 hi) = _lanes(id, g.ply + 1);
         for (uint256 i; i < 8; i++) {

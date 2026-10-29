@@ -13,6 +13,8 @@ import {IMDuelHook, IMDUEL_HOOK_FLAGS} from "../src/IMDuelHook.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {IMDuelHarness, HookConfig} from "./Harness.sol";
 import {Chessboard} from "./Chessboard.sol";
+import {RouteProof} from "./RouteProof.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 
 /// Shared setup: v4 PoolManager and routers, two test tokens, engine v5 and the hook (test harness) at an address
 /// carrying its permission bits. By default currency0 stands in for IMD and currency1 for $IMDUEL, and `pool` is
@@ -123,7 +125,7 @@ abstract contract Base is Chessboard, V4Fixture {
     }
 
     /// Three new blocks with a dust trade (100 wei: no fee) in pool `k`, so a batch there has the three sampled blocks
-    /// it needs; the IMD / ETH route is sampled by ETH batches instead (`sampleRoute`).
+    /// it needs; the hookless IMD / ETH route uses authenticated historical samples instead (`sampleRoute`).
     function sampleBlocks(PoolKey memory k) internal {
         for (uint256 i; i < 3; i++) {
             next(12);
@@ -131,13 +133,23 @@ abstract contract Base is Chessboard, V4Fixture {
         }
     }
 
-    /// `n` new blocks each asking for an ETH batch: with ETH piled, each samples the IMD / ETH route (the third one
-    /// converts).
+    /// `n` new blocks, each supplying a historical route proof and asking for an ETH batch. This fixture uses the
+    /// test route (fee 3000, spacing 60) and synthetic block hashes; the verifier still validates both trie proofs.
     function sampleRoute(uint256 n) internal {
         for (uint256 i; i < n; i++) {
             next(12);
+            proveRoute(vm.getBlockNumber() - 1);
             hook.convert(CurrencyLibrary.ADDRESS_ZERO);
         }
+    }
+
+    function proveRoute(uint256 sampleBlock) internal {
+        PoolKey memory route = PoolKey(CurrencyLibrary.ADDRESS_ZERO, hook.imd(), 3000, 60, IHooks(address(0)));
+        bytes32 slot = keccak256(abi.encode(route.toId(), StateLibrary.POOLS_SLOT));
+        RouteProof.Proof memory p =
+            RouteProof.build(address(manager), slot, uint256(manager.extsload(slot)), sampleBlock - 1);
+        vm.setBlockhash(sampleBlock - 1, keccak256(p.header));
+        hook.sampleRoute(p.header, p.account, p.storageNodes);
     }
 
     function st() internal view returns (IMDuelHook.Game memory) {
@@ -156,7 +168,9 @@ abstract contract Base is Chessboard, V4Fixture {
     }
 
     function count(Vm.Log[] memory logs, bytes32 topic) internal pure returns (uint256 n) {
-        for (uint256 i; i < logs.length; i++) if (logs[i].topics[0] == topic) n++;
+        for (uint256 i; i < logs.length; i++) {
+            if (logs[i].topics[0] == topic) n++;
+        }
     }
 
     function claims(Currency c) internal view returns (uint256) {
@@ -171,7 +185,9 @@ abstract contract Base is Chessboard, V4Fixture {
             if (pools[i].currency0 == c) total += hook.chest(pools[i].toId(), 0);
             if (pools[i].currency1 == c) total += hook.chest(pools[i].toId(), 1);
         }
-        for (uint256 j; j < who.length; j++) total += hook.owed(who[j], c.toId());
+        for (uint256 j; j < who.length; j++) {
+            total += hook.owed(who[j], c.toId());
+        }
         return (claims(c), total);
     }
 

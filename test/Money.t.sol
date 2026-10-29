@@ -67,7 +67,9 @@ contract MoneyTest is Base {
             (uint256 team, uint256 chestIdx) = i == 0 ? (1, 0) : (0, 1);
             before = hook.chest(id, chestIdx);
             trade(team, 1e18, address(0));
-            assertEq(hook.chest(id, chestIdx) - before, 1e18 * bps[i] / 10_000, "the main duel's chest share at this age");
+            assertEq(
+                hook.chest(id, chestIdx) - before, 1e18 * bps[i] / 10_000, "the main duel's chest share at this age"
+            );
             // a duel opened now: no surcharge, even in the main duel's opening minutes
             (ks[i],) = initPool(currency0, currency1, IHooks(address(hook)), fees[i], SQRT_PRICE_1_1);
             addLiquidity(ks[i]);
@@ -93,7 +95,9 @@ contract MoneyTest is Base {
     }
 
     function test_chestsStayAboutEqualInValue() public {
-        for (uint256 i; i < 30; i++) trade(1, 1e18, address(0)); // one-sided trading
+        for (uint256 i; i < 30; i++) {
+            trade(1, 1e18, address(0)); // one-sided trading
+        }
         uint256 c0 = hook.chest(id, 0);
         uint256 c1 = hook.chest(id, 1);
         assertApproxEqRel(c0, c1, 0.2e18, "within 20% at a price near 1");
@@ -106,9 +110,19 @@ contract MoneyTest is Base {
     function test_aTradeStoppedByItsPriceLimitIsRefused() public {
         uint256 before = currency0.balanceOfSelf();
         vm.expectRevert(); // PartialFill, wrapped by the pool manager
-        swapRouter.swap(pool, SwapParams(true, -100e18, SQRT_PRICE_1_1 * 99_999 / 100_000), PoolSwapTest.TestSettings(false, false), "");
+        swapRouter.swap(
+            pool,
+            SwapParams(true, -100e18, SQRT_PRICE_1_1 * 99_999 / 100_000),
+            PoolSwapTest.TestSettings(false, false),
+            ""
+        );
         assertEq(currency0.balanceOfSelf(), before, "nothing paid");
-        swapRouter.swap(pool, SwapParams(true, -1e18, SQRT_PRICE_1_1 * 99_999 / 100_000), PoolSwapTest.TestSettings(false, false), "");
+        swapRouter.swap(
+            pool,
+            SwapParams(true, -1e18, SQRT_PRICE_1_1 * 99_999 / 100_000),
+            PoolSwapTest.TestSettings(false, false),
+            ""
+        );
         assertEq(claims(currency0), 5e15, "a trade that fits inside its limit goes through, at 0.5%");
     }
 
@@ -243,7 +257,9 @@ contract MoneyTest is Base {
         // a native ETH pool: White (ETH's team) is paid in ETH, to a contract that refuses ETH
         (pool, id) = initPool(CurrencyLibrary.ADDRESS_ZERO, currency1, IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
         vm.deal(address(this), 1_000 ether);
-        modifyLiquidityRouter.modifyLiquidity{value: 200 ether}(pool, ModifyLiquidityParams(-887220, 887220, 100e18, 0), "");
+        modifyLiquidityRouter.modifyLiquidity{value: 200 ether}(
+            pool, ModifyLiquidityParams(-887220, 887220, 100e18, 0), ""
+        );
         hook.fundChest{value: 100 ether}(pool, false, 100 ether);
         address refuser = address(new RefusesEth());
         vm.recordLogs();
@@ -319,7 +335,7 @@ contract MoneyTest is Base {
     function testFuzz_heldEqualsOwed(uint256 seed) public {
         fund();
         address[] memory who = new address[](4);
-        (who[0], who[1], who[2], who[3]) = (tx.origin, address(0xA), address(0xB), address(0xC));
+        (who[0], who[1], who[2], who[3]) = (address(swapRouter), address(0xA), address(0xB), address(0xC));
         for (uint256 i; i < 30; i++) {
             seed = uint256(keccak256(abi.encode(seed)));
             if ((seed >> 8) % 4 != 0) next(12 + (seed >> 16) % 40);
