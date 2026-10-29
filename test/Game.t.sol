@@ -61,9 +61,12 @@ contract GameTest is Base {
         assertEq(bid().owner, address(0xB), "the same trade bids for Black");
     }
 
-    function test_ownerDefaultsToSwapSender() public {
+    /// A trade that names no recipient in its hookData bids and plays for nobody: never the router (the swap's
+    /// sender) nor the outer signer.
+    function test_ownerDefaultsToNobody() public {
         white(1e18, address(0));
-        assertEq(bid().owner, address(swapRouter));
+        assertTrue(bid().open, "it still bids");
+        assertEq(bid().owner, address(0));
     }
 
     function test_theOtherTeamCannotBidOnThisTurn() public {
@@ -251,7 +254,7 @@ contract GameTest is Base {
         vm.expectRevert(IMDuelHook.NotManager.selector);
         hook.unlockCallback(abi.encode(uint8(0), abi.encode(address(this), currency0, uint256(1))));
         vm.expectRevert(IMDuelHook.NotSelf.selector);
-        hook.payOut(currency0, address(this), 1);
+        hook.payOut(pool, currency0, address(this), 1);
         vm.expectRevert(IMDuelHook.NotSelf.selector);
         hook.convertBatch(currency0);
     }

@@ -77,13 +77,14 @@ contract LaunchTest is Base {
         uint256 g0 = gasleft();
         buy(50e18);
         emit log_named_uint("first buy (opens game 0, bids for White)", g0 - gasleft());
-        assertEq(bid().owner, address(swapRouter), "the first buy owns White's turn");
+        assertTrue(bid().open, "the first buy takes White's turn");
+        assertEq(bid().owner, address(0), "without a recipient in hookData the move is nobody's: never the router's");
 
         // the pool now holds IMD: a seller in the next block plays White's move and bids for Black
         next(12);
         sell(1_000_000e18);
         assertEq(st().ply, 1, "White's move is played");
-        assertTrue(bid().open && bid().owner == address(swapRouter), "a sell bids for Black");
+        assertTrue(bid().open && bid().owner == address(0), "a sell bids for Black");
 
         // trading on: the IMD slice converts into $IMDUEL in the main duel itself, half to its chest, half burned
         uint256 dead = MockERC20(Currency.unwrap(duel)).balanceOf(address(0xdEaD));
@@ -141,11 +142,11 @@ contract LaunchTest is Base {
         swapNativeInput(pool, true, -0.5 ether, "", 0.5 ether);
         assertGt(t.balanceOf(address(0xdEaD)), dead, "the ETH slice bought $IMDUEL, half burned");
         assertGt(st().ply, 20);
-        // Empty hookData now assigns the bid to the swap router, which cannot receive native ETH in this fixture.
-        // Its failed native payouts remain claims owed to the router, and belong in the solvency equation.
-        address[] memory recipients = new address[](1);
-        recipients[0] = address(swapRouter);
-        assertSolvent(recipients);
+        // every trade here leaves hookData empty: the moves are nobody's, so no bounty is pushed to or owed to the
+        // router (which can't receive ETH) or anyone else
+        assertEq(hook.owed(address(swapRouter), 0), 0, "nothing owed to the router");
+        assertEq(address(swapRouter).balance, 0, "nothing pushed to the router");
+        assertSolvent(nobody());
     }
 
     function test_launchTokenBelowImd() public {

@@ -28,7 +28,7 @@ function need(bool ok, string memory why) pure {
 }
 
 /// Random actions across several duels on one hook, the protocol slice converting through every route. Every action
-/// must succeed (fail_on_revert), and each checks the properties of what it just did (SP-01..06; the global ones are
+/// must succeed (fail_on_revert), and each checks the properties of what it just did (SP-01..07; the global ones are
 /// GL-01..05 below). Runs under Foundry, Echidna and Medusa (test/fuzz/): only cheatcodes all support, except the event
 /// checks, which only Foundry records (`withEvents`).
 contract DuelsHandler is Test {
@@ -37,6 +37,7 @@ contract DuelsHandler is Test {
     using StateLibrary for IPoolManager;
 
     bytes32 constant CONVERTED = keccak256("Converted(address,uint256,uint256,uint256)");
+    bytes32 constant REWARD = keccak256("Reward(bytes32,uint32,uint16,address,address,uint256,bool)");
 
     IMDuelHook public hook;
     bool immutable withEvents; // Foundry: check the batches inside trades from their events
@@ -119,6 +120,13 @@ contract DuelsHandler is Test {
     function _checkBatches(Vm.Log[] memory entries) internal view {
         bytes32 imd = bytes32(uint256(uint160(Currency.unwrap(hook.imd()))));
         for (uint256 i; i < entries.length; i++) {
+            if (entries[i].topics[0] == REWARD) {
+                // SP-07: a bounty only ever goes to a recipient a trade named in its hookData: never to nobody and
+                // never to the swap's sender (the router, where it would be sweepable or stuck)
+                (,, address to,,,) = abi.decode(entries[i].data, (uint32, uint16, address, address, uint256, bool));
+                need(to != address(0) && to != address(router), "SP-07 a bounty goes only to a named recipient");
+                continue;
+            }
             if (entries[i].topics[0] != CONVERTED || entries[i].topics[1] != imd) continue;
             (uint256 spent, uint256 bought,) = abi.decode(entries[i].data, (uint256, uint256, uint256));
             _checkBatch(spent, bought);
@@ -486,8 +494,10 @@ contract InvariantDuelsTest is Base {
             need(g.closeBlock < block.number + hook.turnBlocks(), "GL-05 a window ends at most turnBlocks ahead");
             for (uint256 t; t < 2; t++) {
                 IMDuelHook.TopBid memory b = g.bids[t];
-                if (b.owner == address(0)) {
-                    need(b.size == 0 && b.cap == 0 && b.strength == 0, "GL-05 a move for nobody is empty");
+                // a move for nobody is a timeout move (empty) or the bid of a trade that named no recipient (which
+                // bids and plays like any other; only its bounty goes to nobody: SP-07)
+                if (b.owner == address(0) && b.size == 0) {
+                    need(b.cap == 0 && b.strength == 0, "GL-05 a timeout move is empty");
                 }
                 need(b.strength <= 9_000, "GL-05 strength at most 90%");
             }

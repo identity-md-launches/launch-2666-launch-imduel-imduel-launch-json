@@ -378,9 +378,9 @@ contract IMDuelHook is IUnlockCallback {
     /// Pays a reward straight to `to`; if that fails (a token blocking the address, a contract refusing ETH, a
     /// recipient that touches the PoolManager's deltas), it stays owed and can be withdrawn later. Runs inside the
     /// swap's unlock.
-    function _pay(PoolId id, Game storage g, Currency c, address to, uint256 amount) internal {
+    function _pay(PoolId id, Game storage g, PoolKey calldata key, Currency c, address to, uint256 amount) internal {
         bool paid;
-        try this.payOut{gas: PAYOUT_GAS}(c, to, amount) {
+        try this.payOut{gas: PAYOUT_GAS}(key, c, to, amount) {
             paid = true;
         } catch {
             owed[to][c.toId()] += amount;
@@ -389,13 +389,21 @@ contract IMDuelHook is IUnlockCallback {
     }
 
     /// The recipient is called while the PoolManager is unlocked (ETH's receive, a token's transfer callback). One
-    /// that opens a delta there and leaves it (or closes one) would make the trade revert at the end of its unlock,
-    /// and every later trade that plays the same move: the payout is refused instead, and the reward stays owed.
-    function payOut(Currency c, address to, uint256 amount) external {
+    /// that touches the PoolManager's deltas there would make the trade revert at the end of its unlock, and every
+    /// later trade that plays the same move: the payout is refused instead, and the reward stays owed. Two things are
+    /// checked: the count of nonzero deltas (a delta of anyone's opened or closed), and the hook's own deltas in the
+    /// pool's two currencies, which are nonzero during a trade (the fee claims minted in it are offset by the
+    /// PoolManager only after afterSwap returns), so a settleFor(hook) of 1 wei would move one without crossing zero.
+    function payOut(PoolKey calldata key, Currency c, address to, uint256 amount) external {
         _onlySelf();
         uint256 open = manager.getNonzeroDeltaCount();
+        int256 own0 = manager.currencyDelta(address(this), key.currency0);
+        int256 own1 = manager.currencyDelta(address(this), key.currency1);
         _send(c, to, amount);
-        if (manager.getNonzeroDeltaCount() != open) revert Unsettled();
+        if (
+            manager.getNonzeroDeltaCount() != open || manager.currencyDelta(address(this), key.currency0) != own0
+                || manager.currencyDelta(address(this), key.currency1) != own1
+        ) revert Unsettled();
     }
 
     function _send(Currency c, address to, uint256 amount) internal {
@@ -652,15 +660,17 @@ contract IMDuelHook is IUnlockCallback {
         }
     }
 
-    /// An explicit reward recipient can be packed (20 bytes) or ABI-encoded (32 bytes, clean padding). Otherwise
-    /// the swap sender owns the bid. This is usually a router; tx.origin may be an unrelated bundler or relayer.
-    function _bidOwner(address sender, bytes calldata hookData) internal pure returns (address) {
+    /// The reward recipient a trade names in its hookData: packed (20 bytes) or ABI-encoded (32 bytes, clean padding).
+    /// A trade that names none still bids and plays, for nobody: its move pays no bounty (like a timeout move). The
+    /// swap's sender is not used: through a router it is the router, where a bounty is sweepable by anyone (Universal
+    /// Router's SWEEP) or stuck (a router without receive()); tx.origin may be an unrelated bundler or relayer.
+    function _bidOwner(address, bytes calldata hookData) internal pure returns (address) {
         if (hookData.length == 20) return address(bytes20(hookData));
         if (hookData.length == 32) {
             uint256 value = uint256(bytes32(hookData));
             if (value <= type(uint160).max) return address(uint160(value));
         }
-        return sender;
+        return address(0);
     }
 
     /// The trade a bid is made with: its owner and its strength
@@ -835,7 +845,7 @@ contract IMDuelHook is IUnlockCallback {
         if (amount > t.cap) amount = t.cap;
         if (amount == 0) return;
         _takeChest(id, team, amount);
-        _pay(id, g, team == 0 ? key.currency0 : key.currency1, t.owner, amount);
+        _pay(id, g, key, team == 0 ? key.currency0 : key.currency1, t.owner, amount);
     }
 
     // ---------------------------------------------------------------- position memory

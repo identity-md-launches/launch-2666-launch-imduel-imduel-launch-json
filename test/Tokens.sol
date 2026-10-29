@@ -95,7 +95,9 @@ contract CallbackToken is MockERC20 {
 
     function transfer(address to, uint256 amount) public override returns (bool) {
         bool ok = super.transfer(to, amount);
-        if (to.code.length != 0) try ITransferSink(to).onTransfer() {} catch {}
+        if (to.code.length != 0) {
+            try ITransferSink(to).onTransfer() {} catch {}
+        }
         return ok;
     }
 }
@@ -121,6 +123,39 @@ contract DebtOwner is ITransferSink {
 
     function _debt() internal {
         manager.take(c, address(this), 1);
+    }
+}
+
+/// A move owner that, paid while the PoolManager is unlocked, settles 1 wei of `c` for the hook (sync, pay, settleFor).
+/// The hook already holds a nonzero delta in `c` during the trade (the fee claims it minted), so the delta moves
+/// without crossing zero and the nonzero-delta count is unchanged. Unless the hook sees its own delta move, the
+/// payout "succeeds", the PoolManager then credits the hook 1 wei too many, and the trade reverts at the end of its
+/// unlock (CurrencyNotSettled), and so does every later trade that plays the same move.
+contract SettleForOwner is ITransferSink {
+    IPoolManager immutable manager;
+    address immutable hook;
+    Currency immutable c;
+
+    constructor(IPoolManager manager_, address hook_, Currency c_) {
+        (manager, hook, c) = (manager_, hook_, c_);
+    }
+
+    receive() external payable {
+        _settle();
+    }
+
+    function onTransfer() external {
+        _settle();
+    }
+
+    function _settle() internal {
+        manager.sync(c);
+        if (Currency.unwrap(c) == address(0)) {
+            manager.settleFor{value: 1}(hook);
+        } else {
+            MockERC20(Currency.unwrap(c)).transfer(address(manager), 1);
+            manager.settleFor(hook);
+        }
     }
 }
 

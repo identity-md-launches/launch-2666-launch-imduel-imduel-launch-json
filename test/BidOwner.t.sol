@@ -33,10 +33,12 @@ contract BidOwnerTest is Base {
         wallet.buy(swapRouter, pool, data, MIN_PRICE_LIMIT);
     }
 
-    function test_missingOwnerUsesSwapSenderNotBundler() public {
+    /// No recipient in hookData: the bid is nobody's. Never the swap sender (through a router, the router, where a
+    /// bounty is sweepable or stuck) and never the outer signer (a bundler or relayer).
+    function test_missingOwnerIsNobodyNotTheRouterNorTheBundler() public {
         walletBuy("");
-        assertEq(bid().owner, address(swapRouter));
-        assertTrue(bid().owner != bundler);
+        assertTrue(bid().open, "it still bids");
+        assertEq(bid().owner, address(0));
     }
 
     function test_packedOwnerCreditsTheWallet() public {
@@ -49,15 +51,15 @@ contract BidOwnerTest is Base {
         assertEq(bid().owner, address(wallet));
     }
 
-    function test_dirtyAbiPaddingFallsBackToSender() public {
+    function test_dirtyAbiPaddingIsNobody() public {
         walletBuy(abi.encode(uint256(1) << 160 | uint160(address(wallet))));
-        assertEq(bid().owner, address(swapRouter));
+        assertEq(bid().owner, address(0));
     }
 
-    function testFuzz_otherDataLengthsNeverCreditTheBundler(bytes memory data) public {
+    function testFuzz_otherDataLengthsNeverCreditTheBundlerOrTheRouter(bytes memory data) public {
         vm.assume(data.length != 20 && data.length != 32);
         walletBuy(data);
-        assertEq(bid().owner, address(swapRouter));
+        assertEq(bid().owner, address(0));
     }
 
     function forcedCapture() internal {
@@ -90,8 +92,23 @@ contract BidOwnerTest is Base {
         checkCaptureReward(abi.encode(address(wallet)), address(wallet));
     }
 
-    function test_missingOwnerPaysTheSwapSender() public {
-        checkCaptureReward("", address(swapRouter));
+    /// A move nobody owns is played and pays no bounty: the chest keeps it, nothing goes to or is owed to the router.
+    function test_missingOwnerPlaysButPaysNobody() public {
+        forcedCapture();
+        walletBuy("");
+        MockERC20 reward = MockERC20(Currency.unwrap(currency1));
+        uint256 routerBefore = reward.balanceOf(address(swapRouter));
+        uint256 chestBefore = hook.chest(id, 1);
+        next(12);
+        black(1 ether, address(this));
+        assertEq(st().ply, 1, "the move is played");
+        assertEq(st().moveCaptured, 5);
+        assertEq(st().moveOwner, address(0));
+        assertEq(reward.balanceOf(address(swapRouter)), routerBefore, "nothing pushed to the router");
+        assertEq(hook.owed(address(swapRouter), uint160(Currency.unwrap(currency1))), 0, "nothing owed to the router");
+        assertEq(hook.owed(bundler, uint160(Currency.unwrap(currency1))), 0);
+        assertEq(hook.owed(address(wallet), uint160(Currency.unwrap(currency1))), 0);
+        assertGe(hook.chest(id, 1), chestBefore, "the chest keeps the bounty");
     }
 
     function test_aHookWithoutAnEthRouteRejectsRouteProofs() public {

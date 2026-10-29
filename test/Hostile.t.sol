@@ -14,7 +14,16 @@ import {Rules} from "../src/Rules.sol";
 import {IChessEngine} from "../src/IChessEngine.sol";
 import {IMDuelHook} from "../src/IMDuelHook.sol";
 import {Base} from "./Base.sol";
-import {BlockToken, SkimToken, ReenterToken, VoidToken, CallbackToken, DebtOwner, NoReceive} from "./Tokens.sol";
+import {
+    BlockToken,
+    SkimToken,
+    ReenterToken,
+    VoidToken,
+    CallbackToken,
+    DebtOwner,
+    SettleForOwner,
+    NoReceive
+} from "./Tokens.sol";
 import {ModifyLiquidityParams} from "v4-core/src/types/PoolOperation.sol";
 
 /// Fails to choose; its fallback plays the first legal move.
@@ -110,7 +119,9 @@ contract HostileTest is Base {
         q.approve(address(swapRouter), type(uint256).max);
         q.approve(address(modifyLiquidityRouter), type(uint256).max);
         vm.deal(address(this), 1e30);
-        (pool, id) = initPool(CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(address(q)), IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
+        (pool, id) = initPool(
+            CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(address(q)), IHooks(address(hook)), 3000, SQRT_PRICE_1_1
+        );
         modifyLiquidityRouter.modifyLiquidity{value: 1e27}(pool, ModifyLiquidityParams(-887220, 887220, 1e24, 0), "");
         token = CurrencyLibrary.ADDRESS_ZERO;
     }
@@ -162,8 +173,15 @@ contract HostileTest is Base {
         setUpMainDuel();
         white(1e18, address(0xA)); // a turn to play
         next(12);
-        bytes memory call = abi.encodeCall(PoolSwapTest.swap, (pool, SwapParams(toMove() == 1, -1e18,
-            toMove() == 1 ? MIN_PRICE_LIMIT : MAX_PRICE_LIMIT), PoolSwapTest.TestSettings(false, false), bytes("")));
+        bytes memory call = abi.encodeCall(
+            PoolSwapTest.swap,
+            (
+                pool,
+                SwapParams(toMove() == 1, -1e18, toMove() == 1 ? MIN_PRICE_LIMIT : MAX_PRICE_LIMIT),
+                PoolSwapTest.TestSettings(false, false),
+                bytes("")
+            )
+        );
         uint256 played;
         uint256 reverted;
         for (uint256 g = 200_000; g <= 900_000; g += 10_000) {
@@ -192,8 +210,15 @@ contract HostileTest is Base {
         addLiquidity(pool);
         white(1e18, address(0xA));
         next(12);
-        bytes memory call = abi.encodeCall(PoolSwapTest.swap, (pool, SwapParams(whiteTeam() == 0, -1e17,
-            whiteTeam() == 0 ? MIN_PRICE_LIMIT : MAX_PRICE_LIMIT), PoolSwapTest.TestSettings(false, false), bytes("")));
+        bytes memory call = abi.encodeCall(
+            PoolSwapTest.swap,
+            (
+                pool,
+                SwapParams(whiteTeam() == 0, -1e17, whiteTeam() == 0 ? MIN_PRICE_LIMIT : MAX_PRICE_LIMIT),
+                PoolSwapTest.TestSettings(false, false),
+                bytes("")
+            )
+        );
         (bool ok, bytes memory err) = address(swapRouter).call{gas: 1_500_000}(call);
         assertFalse(ok, "a normal gas limit reverts");
         assertTrue(err.length > 0);
@@ -289,7 +314,9 @@ contract HostileTest is Base {
         pairWith(t);
         hook.fundChest(pool, tokenTeam() == 1, 100e18);
         // first leave a legitimate reward owed to another owner, so the malicious callback attempts an unlock
-        vm.mockCall(address(t), abi.encodeWithSignature("transfer(address,uint256)", address(0xCAFE), 3e18), abi.encode(false));
+        vm.mockCall(
+            address(t), abi.encodeWithSignature("transfer(address,uint256)", address(0xCAFE), 3e18), abi.encode(false)
+        );
         tokenTeamTakesQueenFor(address(0xCAFE));
         finalizeWithATinyTrade();
         assertEq(hook.owed(address(0xCAFE), token.toId()), 3e18);
@@ -355,5 +382,80 @@ contract HostileTest is Base {
         CallbackToken t = new CallbackToken();
         pairWith(t);
         debtOwnerIsRefusedAndTradingGoesOn(pool.currency0 == token ? pool.currency1 : pool.currency0);
+    }
+
+    // ---------------------------------------------------------------- settleFor(hook) inside the payout (finding 68f05aa8, medium)
+
+    /// A move owner that is paid while the PoolManager is unlocked and settles 1 wei for the hook in a currency the
+    /// hook already holds a nonzero delta in (the fee claims minted in this trade): the delta moves without crossing
+    /// zero, so the nonzero-delta count alone would not catch it, and the trade would end with 1 wei unsettled and
+    /// revert, as would every later trade of the duel. The payout must be refused: the reward stays owed, the move is
+    /// played, trading goes on both ways.
+    function settleForOwnerIsRefusedAndTradingGoesOn(Currency settleIn) internal {
+        SettleForOwner r = new SettleForOwner(manager, address(hook), settleIn);
+        if (settleIn.isAddressZero()) vm.deal(address(r), 1 ether);
+        else MockERC20(Currency.unwrap(settleIn)).mint(address(r), 1 ether);
+        if (token.isAddressZero()) hook.fundChest{value: 10 ether}(pool, false, 10 ether);
+        else hook.fundChest(pool, tokenTeam() == 1, 10e18);
+        // the other chest too (bigger), so the trades' chest share is minted in `token`, the smaller chest: the hook's
+        // delta there is nonzero while the payout runs, like its delta in the slice currency
+        Currency other = pool.currency0 == token ? pool.currency1 : pool.currency0;
+        MockERC20(Currency.unwrap(other)).approve(address(hook), type(uint256).max);
+        hook.fundChest(pool, pool.currency1 == other, 100e18);
+        white(1e18, address(r));
+        uint256 chest0 = hook.chest(id, tokenTeam());
+        next(12);
+        black(1e18, address(0)); // plays White's move and pays: it must not revert
+        assertEq(st().ply, 1, "the move is played");
+        uint256 owedNow = hook.owed(address(r), token.toId());
+        assertGt(owedNow, 0, "the reward is owed, not pushed");
+        // this trade's chest share (0.4% of its 1e18 input, in `token`) was added before the move was paid
+        assertEq(hook.chest(id, tokenTeam()) + owedNow, chest0 + 1e18 * hook.CHEST_BPS() / 10_000, "bounty = owed");
+        assertEq(manager.getNonzeroDeltaCount(), 0);
+        next(12);
+        trade(tokenTeam(), 1e18, address(0)); // and trading goes on, both ways
+        next(12);
+        trade(1 - tokenTeam(), 1e18, address(0));
+        address[] memory who = new address[](1);
+        who[0] = address(r);
+        assertSolvent(who);
+    }
+
+    /// Writes the forced-capture position, as queenForcedOn, without trading.
+    function queenForcedPosition() internal {
+        uint256 b;
+        b = put(b, "e1", 6);
+        b = put(b, "h1", 4);
+        b = put(b, "e2", 13);
+        b = put(b, "a8", 14);
+        b = put(b, "a7", 9);
+        hook.setPosition(id, b, side("e1"), side("a8"), 0, 0);
+        assertEq(whiteTeam(), tokenTeam(), "the token's team is White in game 0");
+    }
+
+    function test_anEthOwnerSettlingForTheHookCannotFreezeTheDuel() public {
+        pairEth();
+        queenForcedPosition();
+        settleForOwnerIsRefusedAndTradingGoesOn(pool.currency0); // ETH: the payout currency, where the hook's delta is nonzero
+    }
+
+    function test_anEthOwnerSettlingTheOtherCurrencyForTheHookCannotFreezeTheDuel() public {
+        pairEth();
+        queenForcedPosition();
+        settleForOwnerIsRefusedAndTradingGoesOn(pool.currency1); // the slice currency: nonzero too
+    }
+
+    function test_aCallbackTokenOwnerSettlingForTheHookCannotFreezeTheDuel() public {
+        CallbackToken t = new CallbackToken();
+        pairWith(t);
+        queenForcedPosition();
+        settleForOwnerIsRefusedAndTradingGoesOn(token);
+    }
+
+    function test_aCallbackTokenOwnerSettlingTheOtherCurrencyForTheHookCannotFreezeTheDuel() public {
+        CallbackToken t = new CallbackToken();
+        pairWith(t);
+        queenForcedPosition();
+        settleForOwnerIsRefusedAndTradingGoesOn(pool.currency0 == token ? pool.currency1 : pool.currency0);
     }
 }

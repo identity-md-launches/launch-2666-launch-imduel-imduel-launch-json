@@ -44,8 +44,10 @@ contract LaunchAdmissionTest is V4Fixture {
         bytes memory code = abi.encodePacked(type(IMDuelHook).creationCode, args);
         bytes32 h = keccak256(code);
         uint256 salt;
-        while (uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, h)))) & Hooks.ALL_HOOK_MASK
-            != IMDUEL_HOOK_FLAGS) salt++;
+        while (
+            uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, h)))) & Hooks.ALL_HOOK_MASK
+                != IMDUEL_HOOK_FLAGS
+        ) salt++;
         address at;
         assembly ("memory-safe") {
             at := create2(0, add(code, 32), mload(code), salt)
@@ -93,7 +95,7 @@ contract LaunchAdmissionTest is V4Fixture {
         vm.expectRevert(IMDuelHook.NotManager.selector);
         hook.unlockCallback("");
         vm.expectRevert(IMDuelHook.NotSelf.selector);
-        hook.payOut(imd, address(this), 0);
+        hook.payOut(key, imd, address(this), 0);
         vm.expectRevert(IMDuelHook.NotSelf.selector);
         hook.convertBatch(imd);
 
@@ -118,9 +120,15 @@ contract LaunchAdmissionTest is V4Fixture {
         Currency third = Currency.wrap(address(mockToken("Z", "Z")));
         (Currency a, Currency b) = other < third ? (other, third) : (third, other);
         PoolKey memory noRoute = PoolKey(a, b, 3000, 60, IHooks(address(hook)));
-        vm.expectRevert(abi.encodeWithSelector(CustomRevert.WrappedError.selector, address(hook),
-            IHooks.afterInitialize.selector, abi.encodeWithSelector(IMDuelHook.NoRoute.selector),
-            abi.encodeWithSelector(Hooks.HookCallFailed.selector)));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(hook),
+                IHooks.afterInitialize.selector,
+                abi.encodeWithSelector(IMDuelHook.NoRoute.selector),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
         manager.initialize(noRoute, SQRT_PRICE_1_1);
         assertFalse(hook.game(noRoute.toId()).live, "a duel without a route to $IMDUEL can't open");
         (a, b) = other < imd ? (other, imd) : (imd, other);
