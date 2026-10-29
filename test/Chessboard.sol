@@ -19,8 +19,14 @@ contract RulesHarness {
 /// Board helpers shared by every test: squares by name, positions, replays of the recorded games, mirrored colours.
 /// Encoding in src/Chess.sol (a1 = square 0; 1 pawn 2 bishop 3 knight 4 rook 5 queen 6 king, +8 black).
 abstract contract Chessboard is Test {
-    // Load separately built helpers: embedding their creation code in each suite makes clean IR builds costly.
-    RulesHarness rules = RulesHarness(vm.deployCode("Chessboard.sol:RulesHarness"));
+    // Loaded separately built when a replay first needs it: embedding its creation code in each suite makes clean IR
+    // builds costly, and the cheatcode is Foundry's (Echidna and Medusa never replay).
+    RulesHarness rules;
+
+    function _rules() internal returns (RulesHarness) {
+        if (address(rules) == address(0)) rules = RulesHarness(vm.deployCode("Chessboard.sol:RulesHarness"));
+        return rules;
+    }
 
     function sq(string memory s) internal pure returns (uint16) {
         bytes memory b = bytes(s);
@@ -53,16 +59,15 @@ abstract contract Chessboard is Test {
     /// Plays `move` for the side to move and returns the new position.
     function step(uint256 b, uint32 w, uint32 k, bool black, uint16 move)
         internal
-        view
         returns (uint256, uint32, uint32, Rules.Played memory p)
     {
-        p = rules.move(b, black ? k : w, black ? w : k, black, move);
+        p = _rules().move(b, black ? k : w, black ? w : k, black, move);
         (uint32 nw, uint32 nk) = black ? (p.other, p.mover) : (p.mover, p.other);
         return (p.board, nw, nk, p);
     }
 
     /// The position after the first `n` moves of recorded game `game` (test/data/chess.json).
-    function replay(uint256 game, uint256 n) internal view returns (uint256 b, uint32 w, uint32 k) {
+    function replay(uint256 game, uint256 n) internal returns (uint256 b, uint32 w, uint32 k) {
         uint256[] memory moves = gameMoves(game);
         (b, w, k) = (Chess.START_BOARD, Chess.START_WHITE, Chess.START_BLACK);
         for (uint256 i; i < n; i++) (b, w, k,) = step(b, w, k, i % 2 == 1, uint16(moves[i]));
