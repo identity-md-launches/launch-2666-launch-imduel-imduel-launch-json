@@ -5,6 +5,7 @@ import {Vm} from "forge-std/Test.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
+import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
@@ -258,9 +259,9 @@ contract GameTest is Base {
         HookConfig memory c = config(IChessEngine(address(0)), currency0);
         vm.expectRevert(IMDuelHook.BadConfig.selector);
         newHook(c);
-        c = config(IChessEngine(address(0xC0DE)), currency0); // an address without code: games would never move
-        vm.expectRevert(IMDuelHook.BadConfig.selector);
-        newHook(c);
+        c = config(IChessEngine(address(0xC0DE)), currency0); // an address without code passes: the launch's admission
+        vm.expectPartialRevert(Hooks.HookAddressNotValid.selector); // floor builds the hook on a chain where the engine
+        newHook(c); // has none (its address is checked off chain); only this plain address stops the deploy
         c = config(engine, Currency.wrap(address(0))); // ETH as the pair currency, but also an ETH route
         c.ethFee = 3000;
         vm.expectRevert(IMDuelHook.BadConfig.selector);

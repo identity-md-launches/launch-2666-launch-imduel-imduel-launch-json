@@ -5,6 +5,7 @@ import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
 import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
@@ -43,6 +44,7 @@ contract IMDuelHook is IUnlockCallback {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
     using StateLibrary for IPoolManager;
+    using TransientStateLibrary for IPoolManager;
 
     // ---------------------------------------------------------------- rules of play
     uint256 public constant TURN_TIMEOUT = 600; // seconds without a move before the side to move plays at 0%
@@ -73,7 +75,8 @@ contract IMDuelHook is IUnlockCallback {
     uint256 internal constant PAYOUT_GAS = 100_000;
     uint256 internal constant CONVERT_GAS = 800_000;
     uint256 internal constant BATCH_SQRT_BPS = 10; // a conversion batch stops 0.1% of the sqrt price away (~0.2%)
-    uint256 internal constant ETH_BATCH_MINS = 10; // an ETH batch spends at most 10 minimums (_swapClaims)
+    uint256 internal constant BATCH_MINS = 10; // a batch spends at most 10 minimums (_batch)
+    uint256 internal constant SAMPLE_BITS = 56; // a sampled sqrt price: 8-bit exponent, 48-bit mantissa (_pack)
     address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
     IPoolManager public immutable manager;
@@ -143,11 +146,13 @@ contract IMDuelHook is IUnlockCallback {
     Currency public imduel;
     uint24 internal mainFee;
     int24 internal mainSpacing;
-    uint48 internal ethBlock; // the block of the latest ETH batch: one per block (_convert)
     PoolId public mainId;
-    // The main duel's price at its first swap in the latest block that traded it: block << 160 | sqrtPrice. Batches
-    // buy within 0.1% (sqrt) of it, so a price pushed inside a block can't sell the hook $IMDUEL dear.
-    uint256 internal mainStart;
+    // Price samples of the pools batches swap in (0 the main duel, 1 the IMD / ETH route), one slot each (_sample): the block of the latest batch (40 bits),
+    // the block of the latest sample (40), and the price at the start of the three latest sampled blocks (56 each,
+    // newest lowest). A batch buys within 0.1% (sqrt) of the most hook-favourable of the three, so a price pushed
+    // inside a block, or at the end of the block before, can't sell the hook $IMDUEL dear: it must be held through two
+    // public blocks. The main duel is sampled by its every trade and batch, the IMD / ETH route by each ETH batch.
+    uint256[2] internal samples;
     mapping(uint256 => uint256) public pile; // protocol slices waiting for conversion, by currency id
     mapping(address => mapping(uint256 => uint256)) public owed; // failed payouts, withdrawable by currency id
 
@@ -181,6 +186,7 @@ contract IMDuelHook is IUnlockCallback {
     error NotEnoughGas(); // the engine ran out of gas: send the trade with more
     error NoRoute(); // a duel pairs IMD, $IMDUEL or routed native ETH, so its slice converts into $IMDUEL
     error PartialFill(); // the trade's price limit stopped it before its whole order traded
+    error Unsettled(); // a payout's recipient opened or closed a PoolManager delta: refused, the reward stays owed
 
     /// Plain arguments, as the IMD launch factory passes them (launch.json): the PoolManager, the engine, IMD (the
     /// currency the main duel pairs with; native ETH for an ETH-paired launch, then with no ETH route), the hookless
@@ -190,8 +196,9 @@ contract IMDuelHook is IUnlockCallback {
     constructor(IPoolManager manager_, IChessEngine engine_, Currency imd_, uint24 ethFee_, uint24 ethSpacing_,
         uint256 minImd_, uint256 minEth_, uint256 minImduel_, uint256 turnBlocks_)
     {
-        // an engine without code would answer every call with nothing: no move would ever be played
-        if (address(engine_).code.length == 0 || (ethFee_ != 0 && (imd_.isAddressZero() || minEth_ == 0))
+        // the engine is not checked here: the launch's admission tests build the hook on a chain where it has no code
+        // (hook job f7f2a606); its address is checked off chain, and a trade with no engine to answer just waits
+        if (address(engine_) == address(0) || (ethFee_ != 0 && (imd_.isAddressZero() || minEth_ == 0))
             || ethSpacing_ > uint24(type(int24).max) || turnBlocks_ == 0 || turnBlocks_ > 1_000)
         {
             revert BadConfig();
@@ -268,7 +275,7 @@ contract IMDuelHook is IUnlockCallback {
         PoolId id = key.toId();
         Game storage g = games[id];
         (uint160 sqrtPrice,,,) = manager.getSlot0(id);
-        if (g.main) _blockStart(sqrtPrice);
+        if (g.main) _sample(0, sqrtPrice);
         uint256 depth = manager.getLiquidity(id); // sets a bid's strength: every buy bids
         uint256 chestIdx = _smallerChest(id, sqrtPrice);
         int256 a = params.amountSpecified;
@@ -345,8 +352,9 @@ contract IMDuelHook is IUnlockCallback {
         chests[id] -= i == 0 ? amount : amount << 128;
     }
 
-    /// Pays a reward straight to `to`; if that fails (a token blocking the address, a contract refusing ETH),
-    /// it stays owed and can be withdrawn later. Runs inside the swap's unlock.
+    /// Pays a reward straight to `to`; if that fails (a token blocking the address, a contract refusing ETH, a
+    /// recipient that touches the PoolManager's deltas), it stays owed and can be withdrawn later. Runs inside the
+    /// swap's unlock.
     function _pay(PoolId id, Game storage g, Currency c, address to, uint256 amount) internal {
         bool paid;
         try this.payOut{gas: PAYOUT_GAS}(c, to, amount) {
@@ -357,9 +365,14 @@ contract IMDuelHook is IUnlockCallback {
         emit Reward(id, g.moveGameNo, g.movePly, to, c, amount, paid);
     }
 
+    /// The recipient is called while the PoolManager is unlocked (ETH's receive, a token's transfer callback). One
+    /// that opens a delta there and leaves it (or closes one) would make the trade revert at the end of its unlock,
+    /// and every later trade that plays the same move: the payout is refused instead, and the reward stays owed.
     function payOut(Currency c, address to, uint256 amount) external {
         _onlySelf();
+        uint256 open = manager.getNonzeroDeltaCount();
         _send(c, to, amount);
+        if (manager.getNonzeroDeltaCount() != open) revert Unsettled();
     }
 
     function _send(Currency c, address to, uint256 amount) internal {
@@ -370,10 +383,20 @@ contract IMDuelHook is IUnlockCallback {
     /// Sends `who` their reward payouts in `c` that could not be pushed automatically.
     /// Anyone can call it; the tokens only ever go to `who`.
     function withdraw(address who, Currency c) external {
+        _withdraw(who, c, who);
+    }
+
+    /// The same for the caller's own owed payouts, sent to `to`: for an owner that can't receive them itself (a
+    /// contract without receive(), an address the token blocks).
+    function withdrawTo(Currency c, address to) external {
+        _withdraw(msg.sender, c, to);
+    }
+
+    function _withdraw(address who, Currency c, address to) internal {
         uint256 amount = owed[who][c.toId()];
         if (amount == 0) return;
         owed[who][c.toId()] = 0;
-        manager.unlock(abi.encode(uint8(0), abi.encode(who, c, amount)));
+        manager.unlock(abi.encode(uint8(0), abi.encode(to, c, amount)));
         emit Withdrawn(who, c, amount);
     }
 
@@ -438,16 +461,11 @@ contract IMDuelHook is IUnlockCallback {
         uint256 spent = amount;
         uint256 bought = amount;
         if (c == imd) {
-            (spent, bought) = _swapClaims(_mainKey(), imd, amount, true);
+            (spent, bought) = _swapClaims(_mainKey(), imd, _batch(amount, minImd), true);
         } else if (c.isAddressZero() && ethFee != 0) {
-            // one batch per block: its price limit follows the IMD / ETH price, so a caller who pushed that price
-            // must not sell the whole pile into it batch after batch
-            if (ethBlock == block.number) return;
-            ethBlock = uint48(block.number);
             uint256 imdIn;
             uint256 imdSpent;
-            uint256 batch = amount / ETH_BATCH_MINS > minEth ? ETH_BATCH_MINS * minEth : amount;
-            (spent, imdIn) = _swapClaims(PoolKey(c, imd, ethFee, ethSpacing, IHooks(address(0))), c, batch, false);
+            (spent, imdIn) = _swapClaims(PoolKey(c, imd, ethFee, ethSpacing, IHooks(address(0))), c, _batch(amount, minEth), false);
             (imdSpent, bought) = _swapClaims(_mainKey(), imd, imdIn, true);
             pile[imd.toId()] += imdIn - imdSpent; // what the main duel's price limit left waits with the IMD pile
         } else if (!(c == imduel)) {
@@ -460,38 +478,76 @@ contract IMDuelHook is IUnlockCallback {
         emit Converted(c, spent, bought, burned);
     }
 
-    /// Swaps `amountIn` of `input` in `key` up to the batch price limit, paying and receiving as balance claims. The
-    /// limit is 0.1% (sqrt) past the pool's price: for the `main` duel its price at the start of this block (the limit
-    /// is a band, and an attacker could fill a band past a price it pushed with its own liquidity), for the IMD / ETH
-    /// pool (deep, and not ours to watch) its price now; there a batch is capped instead, at a size not worth the
-    /// fees of pushing a deep pool, and one runs per block (_convert). Nothing is bought once the price is past the limit.
+    /// The most a batch of a pile of `amount` spends: BATCH_MINS minimums (`min`), or the pile.
+    function _batch(uint256 amount, uint256 min) internal pure returns (uint256) {
+        return amount / BATCH_MINS > min ? BATCH_MINS * min : amount;
+    }
+
+    /// Swaps `amountIn` of `input` in `key` (the `main` duel or the IMD / ETH route) up to the batch price limit, paying
+    /// and receiving as balance claims. The limit is 0.1% (sqrt) past the pool's reference price (_reference: the
+    /// limit is a band, and an attacker could fill a band past a price it pushed with its own liquidity). Nothing is
+    /// bought once the price is past the limit, while the pool has fewer than three sampled blocks, or when a batch
+    /// already swapped there this block (one per block: a pushed price must not sell the pile batch after batch).
     function _swapClaims(PoolKey memory key, Currency input, uint256 amountIn, bool main)
         internal
         returns (uint256 spent, uint256 got)
     {
         bool zeroForOne = input == key.currency0;
         (uint160 sqrtPrice,,,) = manager.getSlot0(key.toId());
-        uint256 from = main ? _blockStart(sqrtPrice) : sqrtPrice;
+        uint256 pool = main ? 0 : 1;
+        uint256 s = _sample(pool, sqrtPrice);
+        uint256 from = _reference(s, zeroForOne);
+        if (from == 0 || amountIn == 0) return (0, 0);
         uint160 limit = uint160(
             zeroForOne ? from * (10_000 - BATCH_SQRT_BPS) / 10_000 : from * (10_000 + BATCH_SQRT_BPS) / 10_000
         );
-        // nothing to swap (an ETH batch whose route leg bought no IMD), or the price already past the limit: no swap
-        if (amountIn == 0 || (zeroForOne ? limit >= sqrtPrice : limit <= sqrtPrice)) return (0, 0);
+        if (zeroForOne ? limit >= sqrtPrice : limit <= sqrtPrice) return (0, 0);
         BalanceDelta d = manager.swap(key, SwapParams(zeroForOne, -int256(amountIn), limit), "");
         (int128 inDelta, int128 outDelta) = zeroForOne ? (d.amount0(), d.amount1()) : (d.amount1(), d.amount0());
         spent = uint256(uint128(-inDelta));
         got = uint256(uint128(outDelta));
         manager.burn(address(this), input.toId(), spent);
         manager.mint(address(this), (zeroForOne ? key.currency1 : key.currency0).toId(), got);
+        samples[pool] = (s & ((1 << 208) - 1)) | (block.number << 208); // this block's batch
     }
 
-    /// The main duel's price at the start of this block, given its price now: recorded by the block's first swap there
-    /// (a trade's, before it moves the price, or a batch's).
-    function _blockStart(uint160 sqrtPrice) internal returns (uint160) {
-        uint256 s = mainStart;
-        if (s >> 160 == block.number) return uint160(s);
-        mainStart = block.number << 160 | sqrtPrice;
-        return sqrtPrice;
+    /// Records `sqrtPrice` as pool `pool`'s price at the start of this block, once per block (the first observation
+    /// of a block comes before any swap of it has moved the price), and returns the pool's samples word.
+    function _sample(uint256 pool, uint160 sqrtPrice) internal returns (uint256 s) {
+        s = samples[pool];
+        if ((s >> 168) & 0xffffffffff == block.number) return s;
+        s = (s & (0xffffffffff << 208)) | (block.number << 168) | ((s << SAMPLE_BITS) & ((1 << 168) - 1)) | _pack(sqrtPrice);
+        samples[pool] = s;
+    }
+
+    /// The reference price of a batch from the samples in `s`: the most hook-favourable of the three latest sampled
+    /// blocks' start prices (selling currency0 the price falls: the highest; else the lowest). 0 while fewer than three
+    /// blocks are sampled or a batch already swapped there this block.
+    function _reference(uint256 s, bool zeroForOne) internal view returns (uint256 from) {
+        if (s >> 208 == block.number || (s >> (2 * SAMPLE_BITS)) & ((1 << SAMPLE_BITS) - 1) == 0) return 0;
+        for (uint256 i; i < 3; i++) {
+            uint256 p = _unpack((s >> (i * SAMPLE_BITS)) & ((1 << SAMPLE_BITS) - 1));
+            if (i == 0 || (zeroForOne ? p > from : p < from)) from = p;
+        }
+    }
+
+    /// A sqrt price as an 8-bit exponent and a 48-bit mantissa (a rounding of 2^-47, nothing next to the 0.1% band).
+    function _pack(uint160 p) internal pure returns (uint256) {
+        uint256 v = p;
+        uint256 e;
+        if (v >= 1 << 112) (v, e) = (v >> 64, 64);
+        if (v >= 1 << 80) (v, e) = (v >> 32, e + 32);
+        if (v >= 1 << 64) (v, e) = (v >> 16, e + 16);
+        if (v >= 1 << 56) (v, e) = (v >> 8, e + 8);
+        if (v >= 1 << 52) (v, e) = (v >> 4, e + 4);
+        if (v >= 1 << 50) (v, e) = (v >> 2, e + 2);
+        if (v >= 1 << 49) (v, e) = (v >> 1, e + 1);
+        if (v >= 1 << 48) (v, e) = (v >> 1, e + 1);
+        return e << 48 | v;
+    }
+
+    function _unpack(uint256 packed) internal pure returns (uint256) {
+        return (packed & ((1 << 48) - 1)) << (packed >> 48);
     }
 
     function _mainKey() internal view returns (PoolKey memory) {

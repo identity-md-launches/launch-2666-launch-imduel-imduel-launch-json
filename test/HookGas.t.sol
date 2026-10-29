@@ -140,6 +140,7 @@ contract HookGasTest is Base {
 
     function test_conversionGas() public {
         open(1e15);
+        sampleBlocks(pool);
         trade(1 - whiteTeam(), 0.1e18, address(0)); // a plain trade warms up the pool; its slice stays below the minimum
         uint256 plain = gasOf(1 - whiteTeam(), 0.1e18, address(0));
         uint256 converting = gasOf(1 - whiteTeam(), 10e18, address(0)); // its slice passes the minimum

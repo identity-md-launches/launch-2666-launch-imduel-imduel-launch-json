@@ -22,9 +22,12 @@
     ]
   },
   "token": {
-    "name": "IMDuel Test",
-    "symbol": "IMDUELT",
-    "decimals": 18
+    "contract": "IMDuelToken",
+    "constructorArgs": [],
+    "name": "IMDuel",
+    "symbol": "IMDUEL",
+    "decimals": 18,
+    "totalSupply": "1000000000000000000000000000"
   },
   "pool": {
     "pairedCurrency": "0x0000000000000000000000000000000000000000",

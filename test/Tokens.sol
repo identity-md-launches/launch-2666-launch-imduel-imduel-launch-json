@@ -2,6 +2,8 @@
 pragma solidity ^0.8.26;
 
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {Currency} from "v4-core/src/types/Currency.sol";
 
 /// Refuses transfers to blocked addresses (like a token with a blocklist).
 contract BlockToken is MockERC20 {
@@ -79,5 +81,57 @@ contract VoidToken {
         allowance[from][msg.sender] -= amount;
         balanceOf[from] -= amount;
         balanceOf[to] += amount;
+    }
+}
+
+interface ITransferSink {
+    function onTransfer() external;
+}
+
+/// Tells a contract recipient about every transfer to it (like an ERC-777 or ERC-1363 token): the recipient acts
+/// inside the transfer.
+contract CallbackToken is MockERC20 {
+    constructor() MockERC20("Callback", "CBK", 18) {}
+
+    function transfer(address to, uint256 amount) public override returns (bool) {
+        bool ok = super.transfer(to, amount);
+        if (to.code.length != 0) try ITransferSink(to).onTransfer() {} catch {}
+        return ok;
+    }
+}
+
+/// A move owner that, paid while the PoolManager is unlocked (inside the trade that plays its move), takes 1 wei of
+/// `c` from the PoolManager and leaves that debt unsettled. Unless the hook refuses the payout, the trade ends with a
+/// nonzero delta count and reverts (CurrencyNotSettled), and so does every later trade that plays the same move.
+contract DebtOwner is ITransferSink {
+    IPoolManager immutable manager;
+    Currency immutable c;
+
+    constructor(IPoolManager manager_, Currency c_) {
+        (manager, c) = (manager_, c_);
+    }
+
+    receive() external payable {
+        _debt();
+    }
+
+    function onTransfer() external {
+        _debt();
+    }
+
+    function _debt() internal {
+        manager.take(c, address(this), 1);
+    }
+}
+
+/// Takes no ETH, ever; can call anything (to withdraw its reward elsewhere).
+contract NoReceive {
+    function call(address target, bytes calldata data) external {
+        (bool ok, bytes memory err) = target.call(data);
+        if (!ok) {
+            assembly ("memory-safe") {
+                revert(add(err, 32), mload(err))
+            }
+        }
     }
 }

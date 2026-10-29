@@ -92,6 +92,10 @@ contract LaunchTest is Base {
             if (nextTeam() == (duel == pool.currency0 ? 0 : 1)) buy(100e18);
             else sell(2_000_000e18);
         }
+        assertEq(MockERC20(Currency.unwrap(duel)).balanceOf(address(0xdEaD)), dead, "these trades swing the price every block: no batch trusts it yet");
+        sampleBlocks(pool); // a calm stretch of three blocks
+        next(12);
+        buy(100e18);
         assertGt(MockERC20(Currency.unwrap(duel)).balanceOf(address(0xdEaD)), dead, "slice converted and half burned");
         assertGt(hook.chest(id, duel == pool.currency0 ? 0 : 1), 0, "the $IMDUEL chest grows");
         assertGt(st().ply, 20, "a move every block");
@@ -126,6 +130,9 @@ contract LaunchTest is Base {
             if (nextTeam() == 1) swapNativeInput(pool, true, -0.5 ether, "", 0.5 ether);
             else swap(pool, false, -20_000_000e18, "");
         }
+        sampleBlocks(pool); // a calm stretch of three blocks
+        next(12);
+        swapNativeInput(pool, true, -0.5 ether, "", 0.5 ether);
         assertGt(t.balanceOf(address(0xdEaD)), dead, "the ETH slice bought $IMDUEL, half burned");
         assertGt(st().ply, 20);
         assertSolvent(nobody());

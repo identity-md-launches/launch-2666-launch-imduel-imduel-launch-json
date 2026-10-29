@@ -6,13 +6,16 @@ import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {Vm} from "forge-std/Test.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {Bitboard} from "../src/Bitboard.sol";
 import {Rules} from "../src/Rules.sol";
 import {IChessEngine} from "../src/IChessEngine.sol";
 import {IMDuelHook} from "../src/IMDuelHook.sol";
 import {Base} from "./Base.sol";
-import {BlockToken, SkimToken, ReenterToken, VoidToken} from "./Tokens.sol";
+import {BlockToken, SkimToken, ReenterToken, VoidToken, CallbackToken, DebtOwner, NoReceive} from "./Tokens.sol";
+import {ModifyLiquidityParams} from "v4-core/src/types/PoolOperation.sol";
 
 /// Fails to choose; its fallback plays the first legal move.
 contract BrokenEngine is IChessEngine {
@@ -74,6 +77,7 @@ contract GreedyEngine is IChessEngine {
 
 contract HostileTest is Base {
     using CurrencyLibrary for Currency;
+    using TransientStateLibrary for IPoolManager;
 
     Currency token; // the hostile token, paired with a plain one
 
@@ -97,6 +101,35 @@ contract HostileTest is Base {
         (pool, id) = initPool(c0, c1, IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
         addLiquidity(pool);
         token = Currency.wrap(address(t));
+    }
+
+    /// A native ETH / IMD duel on a hook aside, with liquidity: ETH's team is the "token" team.
+    function pairEth() internal {
+        MockERC20 q = deployHookAside(v5());
+        q.mint(address(this), 1e30);
+        q.approve(address(swapRouter), type(uint256).max);
+        q.approve(address(modifyLiquidityRouter), type(uint256).max);
+        vm.deal(address(this), 1e30);
+        (pool, id) = initPool(CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(address(q)), IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
+        modifyLiquidityRouter.modifyLiquidity{value: 1e27}(pool, ModifyLiquidityParams(-887220, 887220, 1e24, 0), "");
+        token = CurrencyLibrary.ADDRESS_ZERO;
+    }
+
+    /// The token's team (White in game 0) is in check from an unprotected queen next to its king: Kxe2 is its only
+    /// move. `owner` bids for it with 1 unit of the other token; the next block's trade plays it and pays the queen's
+    /// bounty (2.7% of the team's chest, well under the 2x cap) to `owner`, through the real resolve path.
+    function queenForcedOn(address owner) internal {
+        uint256 b;
+        b = put(b, "e1", 6);
+        b = put(b, "h1", 4);
+        b = put(b, "e2", 13);
+        b = put(b, "a8", 14);
+        b = put(b, "a7", 9);
+        hook.setPosition(id, b, side("e1"), side("a8"), 0, 0);
+        assertEq(whiteTeam(), tokenTeam(), "the token's team is White in game 0");
+        white(1e18, owner);
+        next(12);
+        black(1e18, address(0)); // plays White's move first
     }
 
     function tokenTeam() internal view returns (uint256) {
@@ -267,5 +300,60 @@ contract HostileTest is Base {
         assertGt(hook.owed(address(0xB0B), token.toId()), 0, "payout failed safely and is owed");
         assertEq(t.balanceOf(address(0xB0B)), 0);
         assertEq(hook.owed(address(0xCAFE), token.toId()), 3e18, "reentrant withdrawal rolled back");
+    }
+
+    // ---------------------------------------------------------------- payouts inside the unlock (job f7f2a606, medium)
+
+    /// A move owner that is paid while the PoolManager is unlocked may act on it. One that takes 1 wei of anything and
+    /// leaves the debt unsettled would make the whole trade revert after the payout "succeeded", and every later trade
+    /// of the duel repeats the same resolve and the same revert, for about a day. The payout must be refused instead:
+    /// the reward stays owed, the move is played, trading goes on.
+    function debtOwnerIsRefusedAndTradingGoesOn(Currency debtIn) internal {
+        DebtOwner r = new DebtOwner(manager, debtIn);
+        if (token.isAddressZero()) hook.fundChest{value: 10 ether}(pool, false, 10 ether);
+        else hook.fundChest(pool, tokenTeam() == 1, 10e18);
+        uint256 chest0 = hook.chest(id, tokenTeam());
+        queenForcedOn(address(r)); // the trade that plays and pays: it must not revert
+        assertEq(st().ply, 1, "the move is played");
+        uint256 bounty = chest0 * 270 / 10_000;
+        assertEq(hook.owed(address(r), token.toId()), bounty, "the reward is owed, not pushed");
+        assertEq(hook.chest(id, tokenTeam()), chest0 - bounty);
+        assertEq(manager.getNonzeroDeltaCount(), 0);
+        next(12);
+        trade(tokenTeam(), 1e18, address(0)); // and trading goes on, both ways
+        next(12);
+        trade(1 - tokenTeam(), 1e18, address(0));
+        address[] memory who = new address[](1);
+        who[0] = address(r);
+        assertSolvent(who);
+    }
+
+    /// A reward owed to an address that can't receive it (job f7f2a606, low): the owed party sends it where it can.
+    function test_anOwnerThatCannotReceiveWithdrawsElsewhere() public {
+        pairEth();
+        hook.fundChest{value: 10 ether}(pool, false, 10 ether);
+        NoReceive r = new NoReceive();
+        queenForcedOn(address(r));
+        uint256 bounty = 10 ether * 270 / 10_000;
+        assertEq(hook.owed(address(r), 0), bounty, "owed: it takes no ETH");
+        vm.expectRevert();
+        hook.withdraw(address(r), CurrencyLibrary.ADDRESS_ZERO);
+        hook.withdrawTo(CurrencyLibrary.ADDRESS_ZERO, address(0xB0B)); // nobody else's call moves it
+        assertEq(hook.owed(address(r), 0), bounty);
+        r.call(address(hook), abi.encodeCall(IMDuelHook.withdrawTo, (CurrencyLibrary.ADDRESS_ZERO, address(0xB0B))));
+        assertEq(address(0xB0B).balance, bounty, "sent where the owner said");
+        assertEq(hook.owed(address(r), 0), 0);
+        assertSolvent(nobody());
+    }
+
+    function test_anEthOwnerLeavingADebtCannotFreezeTheDuel() public {
+        pairEth();
+        debtOwnerIsRefusedAndTradingGoesOn(pool.currency1);
+    }
+
+    function test_aCallbackTokenOwnerLeavingADebtCannotFreezeTheDuel() public {
+        CallbackToken t = new CallbackToken();
+        pairWith(t);
+        debtOwnerIsRefusedAndTradingGoesOn(pool.currency0 == token ? pool.currency1 : pool.currency0);
     }
 }

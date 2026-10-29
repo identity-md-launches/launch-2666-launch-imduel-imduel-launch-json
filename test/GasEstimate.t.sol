@@ -111,6 +111,7 @@ contract GasEstimateTest is Base {
         deployHook(c);
         (pool, id) = initPool(currency0, currency1, IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
         addLiquidity(pool);
+        sampleBlocks(pool);
         // pays 10 IMD (currency0): its 0.1% slice passes the 0.001 IMD minimum, so this trade converts a batch
         (uint256 g, Vm.Log[] memory logs) = atMinimalGas(swapCall(1, 10e18));
         emit log_named_uint("smallest gas limit that converts", g);

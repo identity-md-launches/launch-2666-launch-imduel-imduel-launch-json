@@ -122,6 +122,24 @@ abstract contract Base is Chessboard, V4Fixture {
         vm.roll(vm.getBlockNumber() + 1);
     }
 
+    /// Three new blocks with a dust trade (100 wei: no fee) in pool `k`, so a batch there has the three sampled blocks
+    /// it needs; the IMD / ETH route is sampled by ETH batches instead (`sampleRoute`).
+    function sampleBlocks(PoolKey memory k) internal {
+        for (uint256 i; i < 3; i++) {
+            next(12);
+            swap(k, true, -100, "");
+        }
+    }
+
+    /// `n` new blocks each asking for an ETH batch: with ETH piled, each samples the IMD / ETH route (the third one
+    /// converts).
+    function sampleRoute(uint256 n) internal {
+        for (uint256 i; i < n; i++) {
+            next(12);
+            hook.convert(CurrencyLibrary.ADDRESS_ZERO);
+        }
+    }
+
     function st() internal view returns (IMDuelHook.Game memory) {
         return hook.game(id);
     }
