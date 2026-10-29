@@ -5,7 +5,11 @@ import {Vm} from "forge-std/Test.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
-import {ModifyLiquidityParams} from "v4-core/src/types/PoolOperation.sol";
+import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {IMDuelHook} from "../src/IMDuelHook.sol";
@@ -53,11 +57,64 @@ contract ProbeOwner {
     }
 }
 
+/// A router that pays its input before the swap, as v4 allows and the guard's own comment names: mode 1 syncs the
+/// input token and transfers it before the swap, settling after it; mode 2 settles the whole input before the swap
+/// (native ETH with value, a token with sync, transfer, settle). It settles and takes exactly what the swap returned,
+/// like a router that checks its amounts, so anything a third party moves in its deltas is left unsettled. It holds
+/// its own funds (the test gives it some), so it pulls nothing from anyone.
+contract PrepaidRouter is IUnlockCallback {
+    using CurrencyLibrary for Currency;
+
+    IPoolManager immutable manager;
+
+    constructor(IPoolManager manager_) {
+        manager = manager_;
+    }
+
+    receive() external payable {}
+
+    function swap(PoolKey calldata key, bool zeroForOne, uint256 amountIn, uint8 mode, bytes calldata hookData)
+        external
+    {
+        manager.unlock(abi.encode(key, zeroForOne, amountIn, mode, hookData));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager));
+        (PoolKey memory key, bool zeroForOne, uint256 amountIn, uint8 mode, bytes memory hookData) =
+            abi.decode(data, (PoolKey, bool, uint256, uint8, bytes));
+        (Currency cin, Currency cout) = zeroForOne ? (key.currency0, key.currency1) : (key.currency1, key.currency0);
+        if (mode == 1) {
+            manager.sync(cin);
+            MockERC20(Currency.unwrap(cin)).transfer(address(manager), amountIn);
+        } else if (cin.isAddressZero()) {
+            manager.settle{value: amountIn}();
+        } else {
+            manager.sync(cin);
+            MockERC20(Currency.unwrap(cin)).transfer(address(manager), amountIn);
+            manager.settle();
+        }
+        BalanceDelta d = manager.swap(
+            key,
+            SwapParams(
+                zeroForOne, -int256(amountIn), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            ),
+            hookData
+        );
+        (int128 dIn, int128 dOut) = zeroForOne ? (d.amount0(), d.amount1()) : (d.amount1(), d.amount0());
+        require(uint256(uint128(-dIn)) == amountIn, "whole order");
+        if (mode == 1) manager.settle();
+        manager.take(cout, address(this), uint256(uint128(dOut)));
+        return "";
+    }
+}
+
 /// The payout guard (payOut): a reward paid inside the trade that plays its move is refused, and left owed, exactly
 /// when the recipient touches the PoolManager's deltas; a recipient that does not is paid at once. Native ETH / IMD
 /// duel, the forced queen capture of the Hostile suite: ETH's team (White in game 0) must play Kxe2.
 contract PayoutGuardTest is Base {
     using CurrencyLibrary for Currency;
+    using TransientStateLibrary for IPoolManager;
 
     Currency constant ETH = CurrencyLibrary.ADDRESS_ZERO;
     ProbeOwner r;
@@ -147,9 +204,7 @@ contract PayoutGuardTest is Base {
     }
 
     /// A recipient that syncs a token, paid inside a trade that pays in that token (the router syncs again before it
-    /// settles): the move is played, the reward is paid or owed, never lost, and trading goes on. The same recipient
-    /// paid inside a trade that pays in native ETH makes that trade revert (NonzeroNativeValue): reported in
-    /// .imd-findings.json, not asserted here.
+    /// settles): the move is played, the reward is paid or owed, never lost, and trading goes on.
     function test_aRecipientThatSyncsIsSettledAroundWhenTheTradePaysInTheToken() public {
         r.set(2, address(0), 0, Currency.wrap(address(q)));
         uint256 before = address(r).balance;
@@ -232,5 +287,89 @@ contract PayoutGuardTest is Base {
         hook.withdraw(address(r), ETH); // nothing left: a no-op
         assertEq(address(r).balance, before + bounty);
         assertSolvent(who());
+    }
+
+    // ---------------------------------------------------------------- the synced currency and reserves (second revision)
+
+    /// The same syncing recipient paid inside the trade that pays native ETH with value (PoolSwapTest settles ETH
+    /// without a sync): before the revision this trade reverted NonzeroNativeValue. Now refused, owed, played.
+    function test_aRecipientThatSyncsATokenIsRefusedWhenTheTradePaysInEth() public {
+        r.set(2, address(0), 0, Currency.wrap(address(q)));
+        uint256 before = address(r).balance;
+        (uint256 amount, bool paid) = playForR();
+        assertFalse(paid, "refused");
+        assertEq(hook.owed(address(r), ETH.toId()), amount, "left owed");
+        assertEq(address(r).balance, before);
+        assertEq(Currency.unwrap(manager.getSyncedCurrency()), address(0), "nothing left synced");
+        tradingGoesOn();
+        r.set(0, address(0), 0, ETH);
+        hook.withdraw(address(r), ETH);
+        assertEq(address(r).balance, before + amount, "collected outside the trade");
+    }
+
+    /// Router mode 1 syncs its input token and transfers it before the swap and settles after: the recipient re-syncs
+    /// that same token, so the synced currency is unchanged but its reserves now include the router's transfer, and
+    /// the router's settle() would credit nothing. The reserves check refuses the payout: the trade settles.
+    function test_aResyncAfterTheRoutersTransferIsRefused() public {
+        PrepaidRouter p = new PrepaidRouter(manager);
+        q.transfer(address(p), 10e18);
+        r.set(2, address(0), 0, Currency.wrap(address(q)));
+        white(1e18, address(r)); // q in, r bids for White's capture
+        next(12);
+        uint256 before = address(r).balance;
+        vm.recordLogs();
+        p.swap(pool, false, 1e18, 1, ""); // q in, ETH out: plays White's move
+        assertEq(st().ply, 1, "the move is played");
+        (uint256 amount, bool paid) = rewardOf(vm.getRecordedLogs());
+        assertFalse(paid, "refused: the synced reserves moved");
+        assertEq(hook.owed(address(r), ETH.toId()), amount, "left owed");
+        assertEq(address(r).balance, before);
+        assertGt(address(p).balance, 0, "the router got its output");
+        assertEq(q.balanceOf(address(p)), 9e18, "and paid exactly its input");
+        tradingGoesOn();
+    }
+
+    /// The same router with a recipient that does nothing: paid inside the trade, which settles.
+    function test_aPlainRecipientIsPaidInsideARouterThatPrepaysByTransfer() public {
+        PrepaidRouter p = new PrepaidRouter(manager);
+        q.transfer(address(p), 10e18);
+        white(1e18, address(r));
+        next(12);
+        uint256 before = address(r).balance;
+        vm.recordLogs();
+        p.swap(pool, false, 1e18, 1, "");
+        (uint256 amount, bool paid) = rewardOf(vm.getRecordedLogs());
+        assertTrue(paid, "paid");
+        assertEq(address(r).balance, before + amount);
+        tradingGoesOn();
+    }
+
+    /// A router that settles native ETH before the swap (mode 2) and a recipient that does nothing: paid, settles.
+    function test_aPlainRecipientIsPaidInsideARouterThatPrepaysEth() public {
+        PrepaidRouter p = new PrepaidRouter(manager);
+        vm.deal(address(p), 10 ether);
+        white(1e18, address(r));
+        next(12);
+        uint256 before = address(r).balance;
+        vm.recordLogs();
+        p.swap(pool, true, 1e18, 2, ""); // ETH in, q out: plays White's move
+        (uint256 amount, bool paid) = rewardOf(vm.getRecordedLogs());
+        assertTrue(paid, "paid");
+        assertEq(address(r).balance, before + amount);
+        assertEq(address(p).balance, 9 ether, "paid exactly its input");
+        tradingGoesOn();
+    }
+
+    function rewardOf(Vm.Log[] memory logs) internal view returns (uint256 amount, bool paid) {
+        uint256 n;
+        for (uint256 i; i < logs.length; i++) {
+            if (logs[i].emitter == address(hook) && logs[i].topics[0] == REWARD) {
+                address to;
+                (,, to,, amount, paid) = abi.decode(logs[i].data, (uint32, uint16, address, Currency, uint256, bool));
+                assertEq(to, address(r));
+                n++;
+            }
+        }
+        assertEq(n, 1, "one reward");
     }
 }
