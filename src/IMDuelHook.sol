@@ -191,7 +191,7 @@ contract IMDuelHook is IUnlockCallback {
     error NotEnoughGas(); // the engine ran out of gas: send the trade with more
     error NoRoute(); // a duel pairs IMD, $IMDUEL or routed native ETH, so its slice converts into $IMDUEL
     error PartialFill(); // the trade's price limit stopped it before its whole order traded
-    error Unsettled(); // a payout's recipient opened or closed a PoolManager delta: refused, the reward stays owed
+    error Unsettled(); // a payout's recipient touched a PoolManager delta or its synced currency: refused, the reward stays owed
     error BadSample();
 
     /// Plain arguments, as the IMD launch factory passes them (launch.json): the PoolManager, the engine, IMD (the
@@ -390,19 +390,26 @@ contract IMDuelHook is IUnlockCallback {
 
     /// The recipient is called while the PoolManager is unlocked (ETH's receive, a token's transfer callback). One
     /// that touches the PoolManager's deltas there would make the trade revert at the end of its unlock, and every
-    /// later trade that plays the same move: the payout is refused instead, and the reward stays owed. Two things are
-    /// checked: the count of nonzero deltas (a delta of anyone's opened or closed), and the hook's own deltas in the
+    /// later trade that plays the same move: the payout is refused instead, and the reward stays owed. Three things
+    /// are checked: the count of nonzero deltas (a delta of anyone's opened or closed); the hook's own deltas in the
     /// pool's two currencies, which are nonzero during a trade (the fee claims minted in it are offset by the
-    /// PoolManager only after afterSwap returns), so a settleFor(hook) of 1 wei would move one without crossing zero.
+    /// PoolManager only after afterSwap returns), so a settleFor(hook) of 1 wei would move one without crossing zero;
+    /// and the PoolManager's synced currency and reserves, which move no delta but decide what the trader's router
+    /// settles next: a sync(token) left in place makes a native settle{value}() revert NonzeroNativeValue, and a
+    /// re-sync after a router has transferred its input makes that settle() credit nothing.
     function payOut(PoolKey calldata key, Currency c, address to, uint256 amount) external {
         _onlySelf();
         uint256 open = manager.getNonzeroDeltaCount();
         int256 own0 = manager.currencyDelta(address(this), key.currency0);
         int256 own1 = manager.currencyDelta(address(this), key.currency1);
+        Currency synced = manager.getSyncedCurrency();
+        uint256 reserves = manager.getSyncedReserves();
         _send(c, to, amount);
         if (
             manager.getNonzeroDeltaCount() != open || manager.currencyDelta(address(this), key.currency0) != own0
                 || manager.currencyDelta(address(this), key.currency1) != own1
+                || Currency.unwrap(manager.getSyncedCurrency()) != Currency.unwrap(synced)
+                || manager.getSyncedReserves() != reserves
         ) revert Unsettled();
     }
 

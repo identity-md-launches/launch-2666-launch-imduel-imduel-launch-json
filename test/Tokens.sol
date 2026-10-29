@@ -159,6 +159,27 @@ contract SettleForOwner is ITransferSink {
     }
 }
 
+/// A move owner that, paid while the PoolManager is unlocked, only calls manager.sync(c): no delta moves, so the delta
+/// checks alone accept the payout, but `c` stays synced for the rest of the unlock. The trader's router then settles
+/// its input without syncing first when it pays native ETH (settle{value}: NonzeroNativeValue), so the trade that
+/// plays the move reverts, and so does every later ETH-paying trade of the duel. The payout must be refused instead.
+contract SyncingOwner is ITransferSink {
+    IPoolManager immutable manager;
+    Currency immutable c;
+
+    constructor(IPoolManager manager_, Currency c_) {
+        (manager, c) = (manager_, c_);
+    }
+
+    receive() external payable {
+        manager.sync(c);
+    }
+
+    function onTransfer() external {
+        manager.sync(c);
+    }
+}
+
 /// Takes no ETH, ever; can call anything (to withdraw its reward elsewhere).
 contract NoReceive {
     function call(address target, bytes calldata data) external {

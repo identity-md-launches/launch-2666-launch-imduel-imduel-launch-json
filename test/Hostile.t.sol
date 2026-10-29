@@ -22,6 +22,7 @@ import {
     CallbackToken,
     DebtOwner,
     SettleForOwner,
+    SyncingOwner,
     NoReceive
 } from "./Tokens.sol";
 import {ModifyLiquidityParams} from "v4-core/src/types/PoolOperation.sol";
@@ -457,5 +458,78 @@ contract HostileTest is Base {
         pairWith(t);
         queenForcedPosition();
         settleForOwnerIsRefusedAndTradingGoesOn(pool.currency0 == token ? pool.currency1 : pool.currency0);
+    }
+
+    // ---------------------------------------------------------------- sync(token) inside the payout (finding 28dc1ba6, medium)
+
+    /// A move owner that, paid while the PoolManager is unlocked, only syncs `syncs`: no delta moves, but the token
+    /// stays synced, and a router that then settles native ETH with value (as every v4 router does, without a sync
+    /// first) reverts NonzeroNativeValue, so the trade that plays the move reverts and every later ETH-paying trade of
+    /// the duel with it. The payout must be refused: the reward stays owed, the move is played, trading goes on.
+    function syncingOwnerIsRefusedAndTradingGoesOn(Currency syncs) internal {
+        SyncingOwner r = new SyncingOwner(manager, syncs);
+        if (token.isAddressZero()) hook.fundChest{value: 10 ether}(pool, false, 10 ether);
+        else hook.fundChest(pool, tokenTeam() == 1, 10e18);
+        // the other chest too (bigger), so the trades' chest share is minted in `token`, the smaller chest
+        Currency other = pool.currency0 == token ? pool.currency1 : pool.currency0;
+        MockERC20(Currency.unwrap(other)).approve(address(hook), type(uint256).max);
+        hook.fundChest(pool, pool.currency1 == other, 100e18);
+        white(1e18, address(r)); // r bids for White's forced capture
+        uint256 chest0 = hook.chest(id, tokenTeam());
+        next(12);
+        black(1e18, address(0)); // the trade that plays it pays in `token` (native ETH in the ETH duel): it must not revert
+        assertEq(st().ply, 1, "the move is played");
+        uint256 owedNow = hook.owed(address(r), token.toId());
+        assertGt(owedNow, 0, "the reward is owed, not pushed");
+        assertEq(hook.chest(id, tokenTeam()) + owedNow, chest0 + 1e18 * hook.CHEST_BPS() / 10_000, "bounty = owed");
+        assertEq(manager.getNonzeroDeltaCount(), 0);
+        assertEq(Currency.unwrap(manager.getSyncedCurrency()), address(0), "nothing left synced");
+        next(12);
+        trade(tokenTeam(), 1e18, address(0)); // and trading goes on, both ways
+        next(12);
+        trade(1 - tokenTeam(), 1e18, address(0));
+        address[] memory who = new address[](1);
+        who[0] = address(r);
+        assertSolvent(who);
+        // the owed reward is collected elsewhere, outside any trade
+        hook.withdraw(address(r), token);
+        assertEq(hook.owed(address(r), token.toId()), 0, "collected");
+        if (token.isAddressZero()) assertEq(address(r).balance, owedNow, "collected in ETH");
+        else assertEq(MockERC20(Currency.unwrap(token)).balanceOf(address(r)), owedNow, "collected in the token");
+    }
+
+    /// The reviewer's case: an ETH / IMD duel, the owner syncs IMD, the ETH-paying trade that plays its move.
+    function test_anEthOwnerSyncingTheOtherCurrencyCannotFreezeTheDuel() public {
+        pairEth();
+        queenForcedPosition();
+        syncingOwnerIsRefusedAndTradingGoesOn(pool.currency1);
+    }
+
+    function test_aCallbackTokenOwnerSyncingTheTokenCannotFreezeTheDuel() public {
+        CallbackToken t = new CallbackToken();
+        pairWith(t);
+        queenForcedPosition();
+        syncingOwnerIsRefusedAndTradingGoesOn(token);
+    }
+
+    function test_aCallbackTokenOwnerSyncingTheOtherCurrencyCannotFreezeTheDuel() public {
+        CallbackToken t = new CallbackToken();
+        pairWith(t);
+        queenForcedPosition();
+        syncingOwnerIsRefusedAndTradingGoesOn(pool.currency0 == token ? pool.currency1 : pool.currency0);
+    }
+
+    /// Syncing native ETH when nothing is synced changes nothing the router depends on: that owner is simply paid.
+    function test_anEthOwnerSyncingEthWhenNothingIsSyncedIsPaid() public {
+        pairEth();
+        queenForcedPosition();
+        SyncingOwner r = new SyncingOwner(manager, CurrencyLibrary.ADDRESS_ZERO);
+        hook.fundChest{value: 10 ether}(pool, false, 10 ether);
+        white(1e18, address(r));
+        next(12);
+        black(1e18, address(0));
+        assertEq(st().ply, 1, "the move is played");
+        assertGt(address(r).balance, 0, "paid inside the trade");
+        assertEq(hook.owed(address(r), 0), 0, "nothing owed");
     }
 }

@@ -17,9 +17,17 @@ contract ScriptedEngine is IChessEngine {
         moveFor[board] = move;
     }
 
-    function play(uint256 board, uint32 mover, uint32 other, bool black, uint256, uint256, uint64[8] calldata,
-        uint32, uint16) external view returns (uint16 m, Rules.Played memory)
-    {
+    function play(
+        uint256 board,
+        uint32 mover,
+        uint32 other,
+        bool black,
+        uint256,
+        uint256,
+        uint64[8] calldata,
+        uint32,
+        uint16
+    ) external view returns (uint16 m, Rules.Played memory) {
         m = moveFor[board];
         return (m, Rules.move(board, mover, other, black, m)); // the rules' cost belongs to the hook's share
     }
@@ -34,7 +42,9 @@ contract ScriptedEngine is IChessEngine {
 contract HookGasTest is Base {
     uint256 constant PLAIN_BUDGET = 200_000;
     uint256 constant BID_BUDGET = 230_000;
-    uint256 constant MOVING_BUDGET = 560_000; // the trade that plays a turn, from a fresh pool jumped to a position
+    // the trade that plays a turn, from a fresh pool jumped to a position; 557k before payOut also checked the
+    // PoolManager's synced currency and reserves (finding 28dc1ba6), 563k with it
+    uint256 constant MOVING_BUDGET = 570_000;
     uint256 constant RUNNING_BUDGET = 480_000; // its average in a running game
     uint256 constant CONVERSION_BUDGET = 350_000;
 
